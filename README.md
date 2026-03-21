@@ -19,7 +19,7 @@ Claude Code sessions are stateless — every session starts fresh. 3am-claude fi
 ## Installation
 
 ```bash
-git clone <repo>
+git clone https://github.com/pthompson8594/3am-Claude.git
 cd 3am-claude
 ./install.sh
 ```
@@ -149,7 +149,7 @@ Copy `config.default.json` to `~/.local/share/3am-claude/config.json` and edit:
 
 `debounce_seconds` controls how long the server waits after the last write before triggering a clustering pass. Each new write resets the timer, so rapid batches of memories coalesce into a single recluster.
 
-`min_cosine` is the internal cosine similarity gate — queries with no seed above this threshold return `[]` before PPR runs, preventing noise amplification. `0.50` is calibrated for `nomic-embed-text-v1.5`. If you switch embedding models, recalibrate using the process in [PPR_PRECISION_CHANGES.md](PPR_PRECISION_CHANGES.md).
+`min_cosine` is the internal cosine similarity gate — queries with no seed above this threshold return `[]` before PPR runs, preventing noise amplification. `0.50` is calibrated for `nomic-embed-text-v1.5`. If you switch embedding models, recalibrate by running off-topic and on-topic queries and finding the threshold where off-topic returns `[]` without clipping real results.
 
 ---
 
