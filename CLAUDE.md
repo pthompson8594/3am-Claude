@@ -28,6 +28,8 @@ Do this in the same turn as completing the work. Do not leave stale planned-feat
 
 Query before answering questions about the project — don't guess at things that are likely stored. Use `min_score=0.01` to trim low-signal padding when context budget matters.
 
+This includes user-facing questions: if asked about the user's name, preferences, or context, query `mcp__3am__query_memory` first before guessing or saying "I don't know". The answer is likely already stored.
+
 ## Session end
 
 Call `wipe_episodic` on clean session end to clear transient work context. Declarative and procedural memories persist.
