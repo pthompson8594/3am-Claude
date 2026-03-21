@@ -1,0 +1,33 @@
+# MCP server
+mcp>=1.3.0
+uvicorn[standard]>=0.27.0
+
+# HTTP client (for optional async cluster theme generation)
+httpx>=0.26.0
+
+# Encryption at rest (Fernet)
+cryptography>=41.0.0
+
+# System keyring — key storage (KWallet on KDE, gnome-keyring on GNOME)
+keyring>=24.0.0
+secretstorage>=3.3.0   # D-Bus backend for keyring on Linux
+
+# Embeddings (CPU only)
+# Install CPU-only torch first on low-RAM systems:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+numpy>=1.24.0
+sentence-transformers>=3.0.0
+einops>=0.8.0            # required by nomic-embed-text-v1.5
+
+# Vector + full-text search
+sqlite-vec>=0.1.6        # SQLite extension for vector similarity search
+
+# Torque Clustering
+scipy>=1.10.0
+
+# Document ingestion (Phase 3, optional)
+# pymupdf>=1.24.0        # PDF text extraction (preferred)
+# pypdf>=4.0.0           # PDF text extraction (fallback)
+# python-docx>=1.1.0     # DOCX text extraction
