@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Local config (don't overwrite the default)
+config.json
+
+# Database & secrets
+*.db
+.env
+SECRET_KEY_3AM
+
+# IDE
+.idea/
+.vscode/
