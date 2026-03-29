@@ -4,7 +4,7 @@ This project is the 3am-claude MCP memory server. These rules govern how to use 
 
 ## Session start
 
-Call `get_session_summary` at the start of every session to orient. The SessionStart hook does this automatically — if context was injected, you're already oriented. If not, call it manually before doing anything else.
+The SessionStart hook bootstraps CLAUDE.md and injects cluster-level orientation. The UserPromptSubmit hook injects relevant memories before every prompt — you should already have context when you need it. If something seems missing, call `query_memory` directly.
 
 ## Storing memories
 
@@ -32,4 +32,4 @@ This includes user-facing questions: if asked about the user's name, preferences
 
 ## Session end
 
-Call `wipe_episodic` on clean session end to clear transient work context. Declarative and procedural memories persist.
+The Stop hook fires after every response and prompts you to store anything worth keeping. The StopSession hook triggers reclustering and wipes episodic memories automatically. No manual `wipe_episodic` call needed.

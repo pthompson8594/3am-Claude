@@ -25,13 +25,14 @@ cd 3am-claude
 ```
 
 `install.sh` will:
-1. Create a virtualenv and install dependencies
+1. Create a virtualenv and install dependencies (including `threeam-core` from a sibling `3am-AI` directory)
 2. Create `~/.local/share/3am-claude/`
 3. Install a systemd user service (if systemd is available)
-4. Write `~/.claude/hooks/3am-session-start.sh` (session orientation hook)
-5. Write `~/.claude/hooks/3am-post-tool-use.sh` (memory capture nudge hook)
-6. Write `~/.claude/hooks/3am-session-stop.sh` (episodic cleanup hook)
-7. Print registration instructions for `~/.claude/settings.json`
+4. Write `~/.claude/hooks/3am-session-start.sh` (CLAUDE.md bootstrap + session orientation)
+5. Write `~/.claude/hooks/3am-prompt-context.sh` (per-prompt memory injection)
+6. Write `~/.claude/hooks/3am-stop.sh` (per-turn memory extraction)
+7. Write `~/.claude/hooks/3am-session-stop.sh` (recluster + episodic cleanup)
+8. Print registration instructions for `~/.claude/settings.json`
 
 ### Register in Claude Code
 
@@ -49,12 +50,14 @@ Add to `~/.claude/settings.json`:
     "SessionStart": [{
       "hooks": [{"type": "command", "command": "~/.claude/hooks/3am-session-start.sh", "timeout": 10}]
     }],
-    "PostToolUse": [{
-      "matcher": "Write|Edit",
-      "hooks": [{"type": "command", "command": "~/.claude/hooks/3am-post-tool-use.sh", "timeout": 5}]
+    "UserPromptSubmit": [{
+      "hooks": [{"type": "command", "command": "~/.claude/hooks/3am-prompt-context.sh", "timeout": 8}]
+    }],
+    "Stop": [{
+      "hooks": [{"type": "command", "command": "~/.claude/hooks/3am-stop.sh", "timeout": 10}]
     }],
     "StopSession": [{
-      "hooks": [{"type": "command", "command": "~/.claude/hooks/3am-session-stop.sh", "timeout": 10}]
+      "hooks": [{"type": "command", "command": "~/.claude/hooks/3am-session-stop.sh", "timeout": 15}]
     }]
   }
 }
@@ -104,13 +107,16 @@ systemctl --user status 3am-claude
 ## Hooks
 
 **SessionStart** (`~/.claude/hooks/3am-session-start.sh`)
-Fires when Claude Code opens. Calls `/api/session-context` on the daemon, which returns cluster themes and sample memories as `additionalContext`. Claude is oriented before the first turn — no tool call turn sitting in context.
+Fires when Claude Code opens. Bootstraps CLAUDE.md on first project visit and injects cluster-level orientation context.
 
-**PostToolUse** (`~/.claude/hooks/3am-post-tool-use.sh`)
-Fires after every `Write` or `Edit` tool call. Injects a brief nudge reminding Claude to consider storing architectural decisions or patterns. Does not auto-store — just surfaces the memory system at decision points.
+**UserPromptSubmit** (`~/.claude/hooks/3am-prompt-context.sh`)
+Fires before every user prompt. Queries the daemon with the prompt text and injects the top 4–5 relevant memories as `additionalContext`. Replaces static session summaries with per-prompt targeted recall — every turn gets the memories most relevant to what you just asked.
+
+**Stop** (`~/.claude/hooks/3am-stop.sh`)
+Fires after every Claude response. Two-pass loop: first pass blocks Claude with a tight extraction prompt ("store anything worth knowing in a future session, then stop"); second pass (`stop_hook_active: true`) passes through. A flag file at `/tmp/3am-stop-{session_id}` prevents infinite loops.
 
 **StopSession** (`~/.claude/hooks/3am-session-stop.sh`)
-Fires when the Claude Code session ends. Reads the `session_id` from the hook payload and POSTs to `/api/session-stop` on the daemon, which wipes all episodic memories tagged with that session ID. Closes the session lifecycle — no need to manually call `wipe_episodic`.
+Fires when the session ends. Triggers a full recluster (incorporating memories stored this session) and wipes episodic memories for the session.
 
 ---
 

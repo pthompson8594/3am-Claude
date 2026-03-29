@@ -470,11 +470,72 @@ class _SessionContextApp:
         await resp(scope, receive, send)
 
 
+class _PromptContextApp:
+    """
+    Minimal ASGI handler for POST /api/prompt-context
+
+    Called by the UserPromptSubmit hook on every user prompt.
+    Runs query_memory against the prompt and returns the top results
+    as additionalContext — gives Claude relevant memories before each turn.
+
+    Body (JSON):
+      project_id — sha256[:16] of git root (may be null)
+      prompt     — the raw user prompt text
+      limit      — max memories to return (default 5)
+    """
+
+    async def __call__(self, scope, receive, send):
+        request = Request(scope, receive)
+
+        if _memory is None:
+            resp = JSONResponse({"error": "memory not ready"}, status_code=503)
+            await resp(scope, receive, send)
+            return
+
+        try:
+            body = await request.json()
+        except Exception:
+            resp = JSONResponse({"error": "invalid JSON"}, status_code=400)
+            await resp(scope, receive, send)
+            return
+
+        project_id = body.get("project_id") or None
+        prompt = body.get("prompt", "").strip()
+        limit = min(int(body.get("limit", 5)), 10)
+
+        if not prompt:
+            resp = JSONResponse({"additionalContext": ""})
+            await resp(scope, receive, send)
+            return
+
+        memories = await _memory.query_memory(
+            query=prompt,
+            project_id=project_id,
+            limit=limit,
+            max_tokens=800,
+            min_score=0.02,
+        )
+
+        if not memories:
+            resp = JSONResponse({"additionalContext": ""})
+            await resp(scope, receive, send)
+            return
+
+        lines = ["[3am] Relevant memories:"]
+        for m in memories:
+            lines.append(f"- [{m['universe']}] {m['content']}")
+
+        resp = JSONResponse({"additionalContext": "\n".join(lines)})
+        await resp(scope, receive, send)
+
+
 class _SessionStopApp:
     """
     Minimal ASGI handler for POST /api/session-stop
 
-    Called by the StopSession hook to wipe episodic memories for the ended session.
+    Called by the StopSession hook at session end.
+    Triggers a full recluster to incorporate memories stored this session,
+    then wipes episodic memories for the ended session.
 
     Query params:
       session_id — the Claude Code session ID (from hook payload)
@@ -494,6 +555,10 @@ class _SessionStopApp:
             await resp(scope, receive, send)
             return
 
+        # Recluster first — incorporates memories stored this session
+        _schedule_cluster()
+        print(f"[3am-claude] StopSession: clustering scheduled for {session_id}")
+
         result = await _memory.wipe_session_episodic(session_id)
         wiped = result.get("wiped", 0)
         if wiped > 0:
@@ -511,6 +576,7 @@ class _CompositeApp:
     def __init__(self, mcp_app):
         self._mcp = mcp_app
         self._session_ctx = _SessionContextApp()
+        self._prompt_ctx = _PromptContextApp()
         self._session_stop = _SessionStopApp()
 
     async def __call__(self, scope, receive, send):
@@ -518,6 +584,8 @@ class _CompositeApp:
             await self._handle_lifespan(receive, send)
         elif scope["type"] == "http" and scope.get("path") == "/api/session-context":
             await self._session_ctx(scope, receive, send)
+        elif scope["type"] == "http" and scope.get("path") == "/api/prompt-context":
+            await self._prompt_ctx(scope, receive, send)
         elif scope["type"] == "http" and scope.get("path") == "/api/session-stop":
             await self._session_stop(scope, receive, send)
         else:

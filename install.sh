@@ -2,13 +2,14 @@
 # install.sh — set up 3am-claude on a new machine
 #
 # What this does:
-#   1. Creates a virtualenv and installs dependencies
+#   1. Creates a virtualenv and installs dependencies (including threeam-core)
 #   2. Creates ~/.local/share/3am-claude/
 #   3. Writes a systemd user service (if systemd is available)
 #   4. Writes the SessionStart hook to ~/.claude/hooks/
-#   5. Writes the PostToolUse memory-nudge hook to ~/.claude/hooks/
-#   6. Writes the StopSession hook to ~/.claude/hooks/
-#   7. Prints next steps
+#   5. Writes the UserPromptSubmit hook to ~/.claude/hooks/
+#   6. Writes the Stop hook to ~/.claude/hooks/
+#   7. Writes the StopSession hook to ~/.claude/hooks/
+#   8. Prints next steps
 
 set -euo pipefail
 
@@ -33,6 +34,25 @@ fi
 echo "==> Installing dependencies..."
 "${VENV}/bin/pip" install --quiet --upgrade pip
 "${VENV}/bin/pip" install --quiet -r "${SCRIPT_DIR}/requirements.txt"
+
+# threeam-core: shared memory/clustering library
+# Looks for 3am-AI as a sibling directory; falls back to prompting.
+THREEAM_AI_DIR="${SCRIPT_DIR}/../3am-AI"
+if [ -f "${THREEAM_AI_DIR}/pyproject.toml" ]; then
+    echo "==> Installing threeam-core from ${THREEAM_AI_DIR}..."
+    "${VENV}/bin/pip" install --quiet -e "${THREEAM_AI_DIR}"
+else
+    echo ""
+    echo "  threeam-core not found at ${THREEAM_AI_DIR}."
+    echo "  Enter the path to your 3am-AI directory (or press Enter to skip):"
+    read -r THREEAM_PATH
+    if [ -n "${THREEAM_PATH}" ] && [ -f "${THREEAM_PATH}/pyproject.toml" ]; then
+        "${VENV}/bin/pip" install --quiet -e "${THREEAM_PATH}"
+        echo "==> threeam-core installed from ${THREEAM_PATH}"
+    else
+        echo "  Skipped. Install manually: pip install -e /path/to/3am-AI"
+    fi
+fi
 echo "    Done."
 
 # ── 2. Data directory ─────────────────────────────────────────────────────────
@@ -76,7 +96,7 @@ HOOK_FILE="${HOOKS_DIR}/3am-session-start.sh"
 cat > "${HOOK_FILE}" <<EOF
 #!/usr/bin/env bash
 # 3am-claude SessionStart hook
-# Injects memory context into Claude Code at session start.
+# Bootstraps CLAUDE.md and injects session-level memory context.
 # Installed by: ${SCRIPT_DIR}/install.sh
 
 PROJECT_ROOT=\$(git rev-parse --show-toplevel 2>/dev/null || pwd)
@@ -101,29 +121,110 @@ EOF
 chmod +x "${HOOK_FILE}"
 echo "==> SessionStart hook installed: ${HOOK_FILE}"
 
-# ── 5. PostToolUse memory-nudge hook ──────────────────────────────────────────
-NUDGE_FILE="${HOOKS_DIR}/3am-post-tool-use.sh"
-cat > "${NUDGE_FILE}" <<'EOF'
+# ── 5. UserPromptSubmit hook ──────────────────────────────────────────────────
+PROMPT_FILE="${HOOKS_DIR}/3am-prompt-context.sh"
+cat > "${PROMPT_FILE}" <<EOF
 #!/usr/bin/env bash
-# 3am-claude PostToolUse hook — memory capture nudge
-# Fires after Write/Edit ~30% of the time to avoid noise.
+# 3am-claude UserPromptSubmit hook
+# Queries memory against each prompt and injects the top 4-5 relevant memories.
+# Installed by: ${SCRIPT_DIR}/install.sh
 
-# Only nudge ~30% of the time
-if [ $(( RANDOM % 10 )) -ge 3 ]; then
+PAYLOAD=\$(cat 2>/dev/null || echo "{}")
+
+PROMPT=\$("${VENV}/bin/python" -c \\
+    "import sys, json; d=json.loads(sys.argv[1]); print(d.get('prompt',''))" \\
+    "\${PAYLOAD}" 2>/dev/null || echo "")
+
+if [ -z "\${PROMPT}" ]; then
     exit 0
 fi
 
-printf '{"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "[3am] If this edit reflects an architectural decision or non-obvious pattern, store_memory it."}}'
-EOF
-chmod +x "${NUDGE_FILE}"
-echo "==> PostToolUse hook installed: ${NUDGE_FILE}"
+PROJECT_ROOT=\$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 
-# ── 6. StopSession hook ───────────────────────────────────────────────────────
+PROJECT_ID=\$(cd "\${PROJECT_ROOT}" && \\
+    "${VENV}/bin/python" -c \\
+    "import sys; sys.path.insert(0,'${SCRIPT_DIR}'); from session import get_project_id; print(get_project_id() or '')" \\
+    2>/dev/null || echo "")
+
+PROMPT_JSON=\$("${VENV}/bin/python" -c \\
+    "import sys, json; print(json.dumps({'project_id': sys.argv[1] or None, 'prompt': sys.argv[2], 'limit': 5}))" \\
+    "\${PROJECT_ID}" "\${PROMPT}" 2>/dev/null || echo "")
+
+if [ -z "\${PROMPT_JSON}" ]; then
+    exit 0
+fi
+
+RESPONSE=\$(curl -sf --max-time 5 \\
+    -X POST \\
+    -H "Content-Type: application/json" \\
+    -d "\${PROMPT_JSON}" \\
+    "http://127.0.0.1:${PORT}/api/prompt-context" \\
+    2>/dev/null || echo "")
+
+if [ -n "\${RESPONSE}" ]; then
+    CONTEXT=\$("${VENV}/bin/python" -c \\
+        "import sys, json; d=json.loads(sys.argv[1]); print(d.get('additionalContext',''))" \\
+        "\${RESPONSE}" 2>/dev/null || echo "")
+    if [ -n "\${CONTEXT}" ]; then
+        "${VENV}/bin/python" -c \\
+            "import sys, json; print(json.dumps({'hookSpecificOutput': {'hookEventName': 'UserPromptSubmit', 'additionalContext': sys.argv[1]}}))" \\
+            "\${CONTEXT}" 2>/dev/null
+    fi
+fi
+EOF
+chmod +x "${PROMPT_FILE}"
+echo "==> UserPromptSubmit hook installed: ${PROMPT_FILE}"
+
+# ── 6. Stop hook ──────────────────────────────────────────────────────────────
+STOP_EXTRACT_FILE="${HOOKS_DIR}/3am-stop.sh"
+cat > "${STOP_EXTRACT_FILE}" <<'STOPEOF'
+#!/usr/bin/env bash
+# 3am-claude Stop hook — per-turn memory extraction (two-pass)
+# Installed by: install.sh
+
+PAYLOAD=$(cat 2>/dev/null || echo "{}")
+
+SESSION_ID=$(python3 -c \
+    "import sys, json; d=json.loads(sys.argv[1]); print(d.get('session_id',''))" \
+    "${PAYLOAD}" 2>/dev/null || echo "")
+
+HOOK_ACTIVE=$(python3 -c \
+    "import sys, json; d=json.loads(sys.argv[1]); print('1' if d.get('stop_hook_active') else '0')" \
+    "${PAYLOAD}" 2>/dev/null || echo "0")
+
+if [ -z "${SESSION_ID}" ]; then
+    exit 0
+fi
+
+FLAG="/tmp/3am-stop-${SESSION_ID}"
+
+if [ "${HOOK_ACTIVE}" = "1" ]; then
+    rm -f "${FLAG}"
+    exit 0
+fi
+
+if [ -f "${FLAG}" ]; then
+    rm -f "${FLAG}"
+    exit 0
+fi
+
+touch "${FLAG}"
+
+python3 -c "
+import json
+msg = '[3am] Without replying, call store_memory for anything from this turn worth knowing in a future session \u2014 what was looked up, decided, or discovered. Then stop.'
+print(json.dumps({'decision': 'block', 'reason': msg}))
+"
+STOPEOF
+chmod +x "${STOP_EXTRACT_FILE}"
+echo "==> Stop hook installed: ${STOP_EXTRACT_FILE}"
+
+# ── 7. StopSession hook ───────────────────────────────────────────────────────
 STOP_FILE="${HOOKS_DIR}/3am-session-stop.sh"
 cat > "${STOP_FILE}" <<EOF
 #!/usr/bin/env bash
 # 3am-claude StopSession hook
-# Auto-wipes episodic memories at session end.
+# Triggers recluster + wipes episodic memories at session end.
 # Installed by: ${SCRIPT_DIR}/install.sh
 
 PAYLOAD=\$(cat 2>/dev/null || echo "{}")
@@ -144,7 +245,7 @@ EOF
 chmod +x "${STOP_FILE}"
 echo "==> StopSession hook installed: ${STOP_FILE}"
 
-# ── 7. Next steps ─────────────────────────────────────────────────────────────
+# ── 8. Next steps ─────────────────────────────────────────────────────────────
 echo ""
 echo "==> Next steps:"
 echo ""
@@ -164,12 +265,14 @@ echo '       "hooks": {'
 echo '         "SessionStart": [{'
 echo '           "hooks": [{"type": "command", "command": "'"${HOOK_FILE}"'", "timeout": 10}]'
 echo '         }],'
-echo '         "PostToolUse": [{'
-echo '           "matcher": "Write|Edit",'
-echo '           "hooks": [{"type": "command", "command": "'"${NUDGE_FILE}"'", "timeout": 5}]'
+echo '         "UserPromptSubmit": [{'
+echo '           "hooks": [{"type": "command", "command": "'"${PROMPT_FILE}"'", "timeout": 8}]'
+echo '         }],'
+echo '         "Stop": [{'
+echo '           "hooks": [{"type": "command", "command": "'"${STOP_EXTRACT_FILE}"'", "timeout": 10}]'
 echo '         }],'
 echo '         "StopSession": [{'
-echo '           "hooks": [{"type": "command", "command": "'"${STOP_FILE}"'", "timeout": 10}]'
+echo '           "hooks": [{"type": "command", "command": "'"${STOP_FILE}"'", "timeout": 15}]'
 echo '         }]'
 echo '       }'
 echo '     }'

@@ -1,3 +1,9 @@
+# Core memory library (shared with 3am-AI)
+# Local: pip install -e /path/to/3am-AI
+# Release: pip install threeam-core  (PyPI)  or
+#          pip install git+https://github.com/pthompson8594/3am-AI.git
+# threeam-core provides: clustering, data_security, torque_clustering, ingest, logger
+
 # MCP server
 mcp>=1.3.0
 uvicorn[standard]>=0.27.0

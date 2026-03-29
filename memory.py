@@ -56,6 +56,36 @@ UNIVERSE_DECAY_MULTIPLIERS = {
 
 CHARS_PER_TOKEN = 4  # rough approximation for max_tokens budget
 
+# Per-universe retrieval fractions by query type (episodic, declarative, procedural).
+# Applied as soft caps on the result set — keeps context balanced for the query intent.
+CONTEXT_BIAS = {
+    "personal":    (0.55, 0.25, 0.20),
+    "factual":     (0.17, 0.63, 0.20),
+    "procedural":  (0.20, 0.25, 0.55),
+    "balanced":    (0.35, 0.40, 0.25),
+}
+
+
+def _classify_query(query: str) -> str:
+    """
+    Heuristic classifier for three-universe context allocation.
+    Returns: "personal" | "factual" | "procedural" | "balanced"
+    """
+    q = query.lower()
+    personal   = sum(1 for w in ("i ", "my ", " me ", " i'", " we ", "our ", "prefer", "like ", "feel ", "tell me about myself", "what do i") if w in q)
+    factual    = sum(1 for w in ("how ", "what is", "explain", "define", "does ", "work ", "what are", "describe", "documentation") if w in q)
+    procedural = sum(1 for w in ("when ", "should ", "pattern", "behavior", "behave", "rule ", "always ", "never ", "if i", "next time", "remember to") if w in q)
+    mx = max(personal, factual, procedural)
+    if mx == 0:
+        return "balanced"
+    if personal == mx and personal > factual and personal > procedural:
+        return "personal"
+    if factual == mx and factual > personal and factual > procedural:
+        return "factual"
+    if procedural == mx and procedural > personal and procedural > factual:
+        return "procedural"
+    return "balanced"
+
 _STOPWORDS = frozenset({
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "is", "was", "are", "were", "be", "been", "have", "has",
@@ -746,7 +776,16 @@ class MemorySystem:
                     entry.access_count += 1
                     entry.last_accessed = now
 
-        # Build result list within token budget
+        # Build result list within token budget, respecting per-universe caps
+        query_type = _classify_query(query)
+        ep_frac, dec_frac, proc_frac = CONTEXT_BIAS[query_type]
+        universe_caps = {
+            "episodic":    max(1, round(limit * ep_frac)),
+            "declarative": max(1, round(limit * dec_frac)),
+            "procedural":  max(1, round(limit * proc_frac)),
+        }
+        universe_counts: dict = {"episodic": 0, "declarative": 0, "procedural": 0}
+
         results = []
         token_count = 0
         for memory_id, score in ranked:
@@ -755,6 +794,9 @@ class MemorySystem:
             entry = self.memories.get(memory_id)
             if not entry:
                 continue
+            u = entry.universe
+            if universe_counts.get(u, 0) >= universe_caps.get(u, limit):
+                continue
             cluster_theme = "General"
             if entry.cluster_id and entry.cluster_id in self.clusters:
                 cluster_theme = self.clusters[entry.cluster_id].theme
@@ -762,6 +804,7 @@ class MemorySystem:
             if token_count + entry_tokens > max_tokens and results:
                 break
             token_count += entry_tokens
+            universe_counts[u] = universe_counts.get(u, 0) + 1
             results.append({
                 "id": entry.id,
                 "content": entry.content,
