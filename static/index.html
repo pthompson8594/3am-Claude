@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3am-claude · memory map</title>
+<style>
+  :root{
+    --bg-primary:#0d1117; --bg-secondary:#161b22; --bg-tertiary:#21262d;
+    --border-color:#30363d; --text-primary:#c9d1d9; --text-secondary:#8b949e;
+    --accent:#58a6ff; --accent-hover:#79c0ff; --success:#3fb950;
+    --error:#f85149; --warning:#d29922; --general:#e3b341;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--bg-primary);color:var(--text-primary);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    overflow:hidden;display:flex;flex-direction:column;height:100vh;
+  }
+  header{
+    display:flex;align-items:center;gap:18px;padding:10px 16px;
+    background:var(--bg-secondary);border-bottom:1px solid var(--border-color);
+    flex:0 0 auto;z-index:5;
+  }
+  header h1{font-size:15px;font-weight:600;letter-spacing:.3px}
+  header h1 .dim{color:var(--text-secondary);font-weight:400}
+  .stats{display:flex;gap:14px;margin-left:auto;font-size:12px;color:var(--text-secondary)}
+  .stats b{color:var(--text-primary)}
+  .stats .gen b{color:var(--general)}
+  .tabs{display:flex;gap:4px;margin-left:18px}
+  .tab{
+    padding:5px 12px;border:1px solid var(--border-color);border-radius:6px;
+    background:var(--bg-tertiary);color:var(--text-secondary);font-size:12px;cursor:pointer;
+  }
+  .tab.active{color:var(--text-primary);border-color:var(--accent)}
+  .tab .badge{
+    display:inline-block;min-width:16px;padding:0 5px;margin-left:6px;border-radius:8px;
+    background:var(--warning);color:#000;font-size:10px;font-weight:700;text-align:center;
+  }
+  main{flex:1;position:relative;overflow:hidden}
+  #map{display:block;width:100%;height:100%;cursor:grab}
+  #map:active{cursor:grabbing}
+
+  .panel{
+    position:absolute;top:0;right:0;width:380px;height:100%;
+    background:var(--bg-secondary);border-left:1px solid var(--border-color);
+    overflow-y:auto;padding:16px;display:none;
+  }
+  .panel.open{display:block}
+  .panel h2{font-size:13px;text-transform:uppercase;letter-spacing:.6px;
+    color:var(--text-secondary);margin-bottom:12px}
+  .card{
+    background:var(--bg-tertiary);border:1px solid var(--border-color);
+    border-radius:8px;padding:12px;margin-bottom:10px;font-size:13px;line-height:1.45;
+  }
+  .card .meta{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+  .chip{
+    font-size:10px;padding:2px 7px;border-radius:10px;background:var(--bg-primary);
+    border:1px solid var(--border-color);color:var(--text-secondary);
+  }
+  .chip.u-declarative{color:#79c0ff;border-color:#264c73}
+  .chip.u-procedural{color:#56d364;border-color:#23502b}
+  .chip.u-episodic{color:#d29922;border-color:#5c4611}
+  .chip.gen{color:var(--general);border-color:#5c4a11}
+  .chip.cos{color:var(--accent)}
+  .card .body{color:var(--text-primary);white-space:pre-wrap;word-break:break-word}
+  .matches{margin-top:8px;border-top:1px dashed var(--border-color);padding-top:8px}
+  .matches .m{font-size:11px;color:var(--text-secondary);margin-top:4px}
+  .matches .m .pid{color:var(--accent)}
+  .row{display:flex;gap:8px;margin-top:10px}
+  button.act{
+    flex:1;padding:7px;border-radius:6px;border:1px solid var(--border-color);
+    background:var(--bg-primary);color:var(--text-primary);font-size:12px;cursor:pointer;
+  }
+  button.act.ok{border-color:var(--success);color:var(--success)}
+  button.act.no{border-color:var(--error);color:var(--error)}
+  button.act:hover{background:var(--bg-tertiary)}
+  .empty{color:var(--text-secondary);font-size:13px;font-style:italic;padding:12px 0}
+  .close{position:absolute;top:12px;right:14px;cursor:pointer;color:var(--text-secondary);
+    font-size:18px;line-height:1}
+  .close:hover{color:var(--text-primary)}
+
+  .legend{
+    position:absolute;left:14px;bottom:14px;background:rgba(22,27,34,.85);
+    border:1px solid var(--border-color);border-radius:8px;padding:10px 12px;font-size:11px;
+    color:var(--text-secondary);backdrop-filter:blur(4px);max-width:230px;
+  }
+  .legend .lr{display:flex;align-items:center;gap:7px;margin-top:5px}
+  .legend .dot{width:10px;height:10px;border-radius:50%}
+  .filters{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+  .filters label{display:flex;align-items:center;gap:4px;cursor:pointer;color:var(--text-primary)}
+  .hint{position:absolute;left:14px;top:14px;font-size:11px;color:var(--text-secondary)}
+  #tip{
+    position:absolute;pointer-events:none;background:rgba(13,17,23,.95);
+    border:1px solid var(--border-color);border-radius:6px;padding:6px 9px;
+    font-size:11px;max-width:280px;display:none;z-index:9;color:var(--text-primary);
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>3am-claude <span class="dim">· memory map</span></h1>
+  <div class="tabs">
+    <div class="tab active" data-tab="map">Map</div>
+    <div class="tab" data-tab="candidates">Candidates<span class="badge" id="candBadge" style="display:none">0</span></div>
+    <div class="tab" data-tab="promotions">Promotions</div>
+  </div>
+  <div class="stats">
+    <span><b id="sMem">–</b> memories</span>
+    <span class="gen"><b id="sGen">–</b> general</span>
+    <span><b id="sClus">–</b> clusters</span>
+    <span><b id="sLink">–</b> links</span>
+  </div>
+</header>
+
+<main>
+  <canvas id="map"></canvas>
+  <div class="hint">drag to pan · scroll to zoom · click a node</div>
+  <div class="legend">
+    <div><b style="color:var(--text-primary)">Legend</b></div>
+    <div class="lr"><span class="dot" style="background:var(--general);box-shadow:0 0 6px var(--general)"></span> general pool (cross-project)</div>
+    <div class="lr"><span class="dot" style="background:#58a6ff"></span> project memory (hue = cluster)</div>
+    <div class="filters">
+      <label><input type="checkbox" id="fDecl" checked> declarative</label>
+      <label><input type="checkbox" id="fProc" checked> procedural</label>
+      <label><input type="checkbox" id="fEpi" checked> episodic</label>
+    </div>
+    <div class="filters"><label><input type="checkbox" id="fGenOnly"> general only</label></div>
+  </div>
+
+  <div class="panel" id="panel">
+    <span class="close" id="panelClose">×</span>
+    <div id="panelBody"></div>
+  </div>
+  <div id="tip"></div>
+</main>
+
+<script>
+const API = "";
+let GRAPH = {nodes:[],links:[],clusters:[],stats:{}};
+let SIM = {nodes:[],links:[]};
+let view = {x:0,y:0,scale:1};
+let activeTab = "map";
+const filters = {declarative:true,procedural:true,episodic:true,genOnly:false};
+
+const canvas = document.getElementById("map");
+const ctx = canvas.getContext("2d");
+const tip = document.getElementById("tip");
+
+function clusterHue(i){ return (i*137.508)%360; } // golden angle
+
+function colorFor(node, clusterIndex){
+  if(node.superseded) return {fill:"#484f58", glow:"#30363d"};  // faded — replaced
+  if(node.is_general) return {fill:"#e3b341", glow:"#e3b341"};
+  if(node.cluster_id==null) return {fill:"#6e7681", glow:"#6e7681"};
+  const h=clusterHue(clusterIndex);
+  return {fill:`hsl(${h},65%,62%)`, glow:`hsl(${h},75%,55%)`};
+}
+function fmtTime(t){ return t? new Date(t*1000).toISOString().slice(0,10) : null; }
+
+function resize(){
+  const r=canvas.getBoundingClientRect();
+  canvas.width=r.width*devicePixelRatio; canvas.height=r.height*devicePixelRatio;
+  ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+}
+window.addEventListener("resize",resize);
+
+async function loadGraph(){
+  const r=await fetch(API+"/api/ui/graph"); GRAPH=await r.json();
+  document.getElementById("sMem").textContent=GRAPH.stats.memories;
+  document.getElementById("sGen").textContent=GRAPH.stats.general;
+  document.getElementById("sClus").textContent=GRAPH.stats.clusters;
+  document.getElementById("sLink").textContent=GRAPH.stats.links;
+  buildSim();
+}
+
+function passFilter(n){
+  if(filters.genOnly && !n.is_general) return false;
+  return filters[n.universe]!==false;
+}
+
+function buildSim(){
+  const clusterIndex={}; GRAPH.clusters.forEach((c,i)=>clusterIndex[c.id]=i);
+  const R=canvas.getBoundingClientRect();
+  const cx=R.width/2, cy=R.height/2;
+  const byId={};
+  SIM.nodes=GRAPH.nodes.filter(passFilter).map(n=>{
+    const ci = n.cluster_id!=null?clusterIndex[n.cluster_id]:-1;
+    const col=colorFor(n,ci);
+    const node={...n, ci,
+      x: cx + (Math.random()-0.5)*R.width*0.7,
+      y: cy + (Math.random()-0.5)*R.height*0.7,
+      vx:0,vy:0,
+      r: 4 + n.priority*1.6 + Math.min(n.access_count,8)*0.4,
+      fill:col.fill, glow:col.glow};
+    byId[n.id]=node; return node;
+  });
+  SIM.links=GRAPH.links.filter(l=>byId[l.source]&&byId[l.target])
+    .map(l=>({s:byId[l.source],t:byId[l.target],w:l.weight}));
+  // cluster centroids (for label placement + gentle grouping)
+  SIM.clusterAnchors={};
+  GRAPH.clusters.forEach((c,i)=>{
+    const ang=clusterHue(i)*Math.PI/180;
+    const rad=Math.min(R.width,R.height)*0.32;
+    SIM.clusterAnchors[c.id]={x:cx+Math.cos(ang)*rad, y:cy+Math.sin(ang)*rad,
+      theme:c.theme, i};
+  });
+  SIM.alpha=1;
+}
+
+function tick(){
+  if(activeTab!=="map"){ requestAnimationFrame(tick); return; }
+  const R=canvas.getBoundingClientRect();
+  const cx=R.width/2, cy=R.height/2;
+  const N=SIM.nodes;
+  if(SIM.alpha>0.02){
+    // repulsion
+    for(let i=0;i<N.length;i++){
+      const a=N[i];
+      for(let j=i+1;j<N.length;j++){
+        const b=N[j];
+        let dx=a.x-b.x, dy=a.y-b.y; let d2=dx*dx+dy*dy+0.01;
+        if(d2<40000){
+          const f=900/d2; const d=Math.sqrt(d2);
+          const fx=dx/d*f, fy=dy/d*f;
+          a.vx+=fx;a.vy+=fy;b.vx-=fx;b.vy-=fy;
+        }
+      }
+    }
+    // springs
+    for(const l of SIM.links){
+      let dx=l.t.x-l.s.x, dy=l.t.y-l.s.y; const d=Math.sqrt(dx*dx+dy*dy)+0.01;
+      const target=70; const f=(d-target)*0.01*(0.4+l.w);
+      const fx=dx/d*f, fy=dy/d*f;
+      l.s.vx+=fx;l.s.vy+=fy;l.t.vx-=fx;l.t.vy-=fy;
+    }
+    // cluster grouping + centering
+    for(const n of N){
+      const anchor=n.cluster_id!=null?SIM.clusterAnchors[n.cluster_id]:null;
+      if(anchor){ n.vx+=(anchor.x-n.x)*0.006; n.vy+=(anchor.y-n.y)*0.006; }
+      else { n.vx+=(cx-n.x)*0.002; n.vy+=(cy-n.y)*0.002; }
+      if(n.is_general){ n.vx+=(cx-n.x)*0.004; n.vy+=(cy-n.y)*0.004; }
+      n.vx*=0.85; n.vy*=0.85;
+      n.x+=n.vx*SIM.alpha; n.y+=n.vy*SIM.alpha;
+    }
+    SIM.alpha*=0.992;
+  }
+  draw(R);
+  requestAnimationFrame(tick);
+}
+
+function draw(R){
+  ctx.clearRect(0,0,R.width,R.height);
+  ctx.save();
+  ctx.translate(view.x,view.y); ctx.scale(view.scale,view.scale);
+  // links
+  ctx.lineWidth=0.6;
+  for(const l of SIM.links){
+    ctx.strokeStyle="rgba(88,166,255,"+(0.05+l.w*0.10)+")";
+    ctx.beginPath(); ctx.moveTo(l.s.x,l.s.y); ctx.lineTo(l.t.x,l.t.y); ctx.stroke();
+  }
+  // nodes
+  for(const n of SIM.nodes){
+    ctx.beginPath();
+    ctx.fillStyle=n.fill;
+    ctx.shadowColor=n.glow; ctx.shadowBlur=n.is_general?16:8;
+    ctx.arc(n.x,n.y,n.r,0,Math.PI*2); ctx.fill();
+    ctx.shadowBlur=0;
+    if(n.is_general){
+      ctx.lineWidth=1.5; ctx.strokeStyle="#fff5d6"; ctx.stroke();
+    }
+  }
+  // cluster labels
+  ctx.shadowBlur=0;
+  for(const cid in SIM.clusterAnchors){
+    const a=SIM.clusterAnchors[cid];
+    ctx.fillStyle="rgba(201,209,217,0.55)";
+    ctx.font="11px -apple-system,sans-serif";
+    ctx.textAlign="center";
+    ctx.fillText(a.theme,a.x,a.y-6);
+  }
+  ctx.restore();
+}
+
+// ── interaction ──────────────────────────────────────────────
+function toWorld(px,py){ return {x:(px-view.x)/view.scale, y:(py-view.y)/view.scale}; }
+function nodeAt(px,py){
+  const w=toWorld(px,py);
+  for(let i=SIM.nodes.length-1;i>=0;i--){
+    const n=SIM.nodes[i]; const dx=n.x-w.x,dy=n.y-w.y;
+    if(dx*dx+dy*dy<=(n.r+3)*(n.r+3)) return n;
+  }
+  return null;
+}
+let drag=null;
+canvas.addEventListener("mousedown",e=>{ drag={x:e.clientX,y:e.clientY,vx:view.x,vy:view.y,moved:false}; });
+window.addEventListener("mouseup",e=>{
+  if(drag && !drag.moved){
+    const r=canvas.getBoundingClientRect();
+    const n=nodeAt(e.clientX-r.left,e.clientY-r.top);
+    if(n) showNode(n);
+  }
+  drag=null;
+});
+window.addEventListener("mousemove",e=>{
+  const r=canvas.getBoundingClientRect();
+  if(drag){
+    const dx=e.clientX-drag.x, dy=e.clientY-drag.y;
+    if(Math.abs(dx)+Math.abs(dy)>3) drag.moved=true;
+    view.x=drag.vx+dx; view.y=drag.vy+dy; return;
+  }
+  const n=nodeAt(e.clientX-r.left,e.clientY-r.top);
+  if(n){
+    tip.style.display="block";
+    tip.style.left=(e.clientX+12)+"px"; tip.style.top=(e.clientY+12)+"px";
+    tip.textContent=(n.is_general?"★ general · ":"")+n.cluster_theme+" — "+n.content.slice(0,90);
+  } else tip.style.display="none";
+});
+canvas.addEventListener("wheel",e=>{
+  e.preventDefault();
+  const r=canvas.getBoundingClientRect();
+  const mx=e.clientX-r.left, my=e.clientY-r.top;
+  const before=toWorld(mx,my);
+  view.scale*=e.deltaY<0?1.1:0.9; view.scale=Math.max(0.2,Math.min(4,view.scale));
+  const after=toWorld(mx,my);
+  view.x+=(after.x-before.x)*view.scale; view.y+=(after.y-before.y)*view.scale;
+},{passive:false});
+
+// ── panel ────────────────────────────────────────────────────
+const panel=document.getElementById("panel");
+const panelBody=document.getElementById("panelBody");
+document.getElementById("panelClose").onclick=()=>panel.classList.remove("open");
+
+function esc(s){return (s||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+
+function showNode(n){
+  activeTab="map";
+  panelBody.innerHTML=`
+    <h2>Memory</h2>
+    <div class="card">
+      <div class="meta">
+        <span class="chip u-${n.universe}">${n.universe}</span>
+        ${n.is_general?'<span class="chip gen">★ general</span>':`<span class="chip">proj ${esc((n.project_id||"").slice(0,8))}</span>`}
+        <span class="chip">P${n.priority}</span>
+        ${n.category&&n.category!=="general"?`<span class="chip">${esc(n.category)}</span>`:""}
+        ${fmtTime(n.event_time)?`<span class="chip cos">⏱ ${fmtTime(n.event_time)}</span>`:""}
+        ${n.superseded?'<span class="chip" style="color:var(--error);border-color:#5c1f1f">superseded</span>':""}
+        <span class="chip">${esc(n.cluster_theme)}</span>
+        ${(n.tags||[]).map(t=>`<span class="chip">${esc(t)}</span>`).join("")}
+      </div>
+      <div class="body">${esc(n.content)}</div>
+    </div>`;
+  panel.classList.add("open");
+}
+
+async function showCandidates(){
+  const r=await fetch(API+"/api/ui/candidates"); const {candidates}=await r.json();
+  const badge=document.getElementById("candBadge");
+  if(candidates.length){badge.style.display="inline-block";badge.textContent=candidates.length;}
+  else badge.style.display="none";
+  if(!candidates.length){ panelBody.innerHTML='<h2>Promotion candidates</h2><div class="empty">Nothing queued. Borderline cross-project matches appear here for review.</div>'; panel.classList.add("open"); return;}
+  panelBody.innerHTML='<h2>Promotion candidates</h2>'+candidates.map(c=>`
+    <div class="card" data-cid="${c.candidate_id}">
+      <div class="meta">
+        <span class="chip u-${c.universe}">${c.universe}</span>
+        <span class="chip cos">cos ${c.best_cosine}</span>
+        <span class="chip">${c.projects.length} projects</span>
+      </div>
+      <div class="body">${esc(c.content)}</div>
+      <div class="matches">${c.matches.map(m=>`<div class="m"><span class="pid">${esc((m.project_id||"·").slice(0,8))}</span> ${esc(m.preview)}</div>`).join("")}</div>
+      <div class="row">
+        <button class="act ok" onclick="approve(${c.candidate_id})">Promote → general</button>
+        <button class="act no" onclick="dismissC(${c.candidate_id})">Dismiss</button>
+      </div>
+    </div>`).join("");
+  panel.classList.add("open");
+}
+
+async function showPromotions(){
+  const r=await fetch(API+"/api/ui/promotions"); const {promotions}=await r.json();
+  if(!promotions.length){ panelBody.innerHTML='<h2>Promotion log</h2><div class="empty">No promotions yet.</div>'; panel.classList.add("open"); return;}
+  panelBody.innerHTML='<h2>Promotion log</h2>'+promotions.map(p=>`
+    <div class="card">
+      <div class="meta">
+        <span class="chip gen">★ general</span>
+        <span class="chip">${p.trigger}</span>
+        <span class="chip cos">cos ${p.best_cosine}</span>
+        <span class="chip">from ${esc((p.original_project||"·").slice(0,8))}</span>
+      </div>
+      <div class="body">${esc(p.content)}</div>
+      <div class="row"><button class="act no" onclick="revertP(${p.promotion_id})">Revert to project</button></div>
+    </div>`).join("");
+  panel.classList.add("open");
+}
+
+async function approve(id){ await fetch(API+"/api/ui/candidates/approve?id="+id,{method:"POST"}); await loadGraph(); showCandidates(); }
+async function dismissC(id){ await fetch(API+"/api/ui/candidates/dismiss?id="+id,{method:"POST"}); showCandidates(); }
+async function revertP(id){ await fetch(API+"/api/ui/promotions/revert?id="+id,{method:"POST"}); await loadGraph(); showPromotions(); }
+
+// ── tabs / filters ───────────────────────────────────────────
+document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
+  document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+  t.classList.add("active"); activeTab=t.dataset.tab;
+  if(activeTab==="map"){ panel.classList.remove("open"); }
+  else if(activeTab==="candidates") showCandidates();
+  else if(activeTab==="promotions") showPromotions();
+});
+function bindFilter(id,key){ document.getElementById(id).onchange=e=>{filters[key]=e.target.checked; buildSim();}; }
+bindFilter("fDecl","declarative"); bindFilter("fProc","procedural");
+bindFilter("fEpi","episodic"); bindFilter("fGenOnly","genOnly");
+
+// ── boot ─────────────────────────────────────────────────────
+resize();
+loadGraph().then(()=>{ requestAnimationFrame(tick); pollCandidates(); });
+async function pollCandidates(){
+  try{
+    const r=await fetch(API+"/api/ui/candidates"); const {candidates}=await r.json();
+    const badge=document.getElementById("candBadge");
+    if(candidates.length){badge.style.display="inline-block";badge.textContent=candidates.length;}
+    else badge.style.display="none";
+  }catch(e){}
+  setTimeout(pollCandidates,15000);
+}
+</script>
+</body>
+</html>
