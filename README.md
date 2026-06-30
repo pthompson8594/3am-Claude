@@ -13,6 +13,47 @@ Claude Code sessions are stateless — every session starts fresh. 3am-claude fi
 - **Semantic retrieval.** Queries use hybrid FTS5 + vector search, expanded with Personalized PageRank over semantic lanes. Project A memories cannot walk to Project B — only through the general pool.
 - **Self-organizing clusters.** Every write triggers a debounced clustering pass (default 10s after the last write), keeping memories organized as they accumulate.
 - **Encrypted at rest.** Fernet encryption keyed from the system keyring (KWallet, gnome-keyring). The key is never written to disk.
+- **Auto-promotion.** When the same knowledge independently shows up in two different projects, it's general by definition. 3am-claude detects this at store time and lifts it into the shared pool automatically (high-confidence) or queues it for one-click review (borderline).
+
+---
+
+## Auto-promotion
+
+Cross-project isolation means a project-scoped memory is *only* ever recalled by its own project — so "recalled in N projects" can never be the promotion signal. The real signal is **store-time cross-project similarity**: when you store a memory and a near-identical one already exists in a *different* project, that knowledge is general.
+
+It's a hybrid policy, tuned by `config.json`:
+
+| Best cross-project cosine | Spans ≥ `promote_min_projects` | Action |
+|---|---|---|
+| ≥ `promote_auto_cosine` (0.90) | yes | **Auto-promote** to general — logged + reversible |
+| ≥ `promote_candidate_cosine` (0.82) | yes | **Queue** as a candidate for confirmation |
+| below | — | left project-scoped |
+
+Every auto-promotion is written to an audit log (`list_promotions`) and can be undone (`revert_promotion`) — it just restores the original `project_id`. Candidates are reviewed with `approve_promotion` / `dismiss_promotion`, or visually in the web UI. Set `"auto_promote": false` to make *everything* go through the review queue instead.
+
+---
+
+## Temporal memory
+
+Facts change. 3am-claude handles time along two axes:
+
+**Contradiction / supersession** (ported from the 3am-AI engine). When a fact is replaced — "we migrated from Flask to FastAPI", "moved from Saskatoon to Regina" — use `supersede_memory` (or `apply_correction` for an explicit user correction). The old memory isn't deleted: it's flagged `superseded_by`, **decays 10× faster**, and is **excluded from retrieval**, but stays in the DB for audit. A background **conflict-detection** pass (during clustering, or on-demand via `resolve_conflicts`) catches contradictions you didn't flag: same-category memories that are close-but-not-duplicate get resolved by keeping the newer one.
+
+**Time-grounded retrieval.** Memories carry an optional `event_time` (when the fact is *about*, vs. the store-time `timestamp`), and temporal questions ("when did X", "before/after") automatically widen the retrieval beam. Combined with soft per-universe caps (unused slots backfill instead of being wasted), this substantially lifts recall on time-oriented queries — see [benchmarks/README.md](benchmarks/README.md) for the before/after on LoCoMo.
+
+**Category-aware decay.** A memory's `category` (`identity`, `preferences`, `projects`, `activities`, …) scales its decay rate: who you are barely fades; a one-off activity fades normally.
+
+---
+
+## Web UI — memory map
+
+A dependency-free visualizer is served by the daemon at **http://127.0.0.1:8765/ui**:
+
+- A force-directed **memory map** — nodes are memories (hue = cluster, size = priority/access), general-pool memories ringed in gold, semantic lanes drawn between them, cluster themes floating as labels. Drag to pan, scroll to zoom, click a node for full content.
+- A **Candidates** tab — the promotion review queue, with cross-project match previews and Promote / Dismiss buttons.
+- A **Promotions** tab — the audit log, with one-click Revert.
+
+It reads the local DB through the daemon (`/api/ui/*`); nothing leaves your machine. Styling mirrors the 3am web interface.
 
 ---
 
@@ -30,22 +71,34 @@ cd 3am-claude
 3. Install a systemd user service (if systemd is available)
 4. Write `~/.claude/hooks/3am-session-start.sh` (CLAUDE.md bootstrap + session orientation)
 5. Write `~/.claude/hooks/3am-prompt-context.sh` (per-prompt memory injection)
-6. Write `~/.claude/hooks/3am-stop.sh` (per-turn memory extraction)
-7. Write `~/.claude/hooks/3am-session-stop.sh` (recluster + episodic cleanup)
-8. Print registration instructions for `~/.claude/settings.json`
+6. Write `~/.claude/hooks/3am-stop.sh` (importance-aware memory extraction)
+   and install bundled skills (e.g. `3am-consolidate`) into `~/.claude/skills/`
+7. Write `~/.claude/hooks/3am-precompact.sh` (pre-compaction memory flush)
+8. Write `~/.claude/hooks/3am-session-stop.sh` (recluster + episodic cleanup)
+9. Print registration instructions for `~/.claude/settings.json`
 
 ### Register in Claude Code
 
-Add to `~/.claude/settings.json`:
+**1. Register the MCP server.** MCP servers are *not* read from `settings.json` — they live in `~/.claude.json` (user scope) or a project `.mcp.json`. Use the CLI (writes to `~/.claude.json` for all projects):
+
+```bash
+claude mcp add --transport http --scope user 3am http://127.0.0.1:8765/mcp
+```
+
+Or, if the `claude` CLI isn't on your PATH (e.g. VS Code extension only), add it to `~/.claude.json` by hand under the top-level `mcpServers` key:
 
 ```json
 {
   "mcpServers": {
-    "3am": {
-      "type": "http",
-      "url": "http://127.0.0.1:8765/mcp"
-    }
-  },
+    "3am": { "type": "http", "url": "http://127.0.0.1:8765/mcp" }
+  }
+}
+```
+
+**2. Register the hooks** in `~/.claude/settings.json` (hooks *are* read from here):
+
+```json
+{
   "hooks": {
     "SessionStart": [{
       "hooks": [{"type": "command", "command": "~/.claude/hooks/3am-session-start.sh", "timeout": 10}]
@@ -56,7 +109,10 @@ Add to `~/.claude/settings.json`:
     "Stop": [{
       "hooks": [{"type": "command", "command": "~/.claude/hooks/3am-stop.sh", "timeout": 10}]
     }],
-    "StopSession": [{
+    "PreCompact": [{
+      "hooks": [{"type": "command", "command": "~/.claude/hooks/3am-precompact.sh", "timeout": 10}]
+    }],
+    "SessionEnd": [{
       "hooks": [{"type": "command", "command": "~/.claude/hooks/3am-session-stop.sh", "timeout": 15}]
     }]
   }
@@ -85,8 +141,17 @@ systemctl --user status 3am-claude
 | `get_session_summary` | Cluster themes for the current project + general pool. Call at session start. |
 | `ingest_document` | Batch-store a list of propositions (Claude extracts them from docs). |
 | `correct_memory` | Replace memory content in-place, re-embeds, rebuilds lanes. |
+| `supersede_memory` | Record that a fact *changed* — stores the new value, fades the old one (kept for audit). |
+| `apply_correction` | Apply a user correction: find the memory matching the wrong claim and supersede it. |
+| `resolve_conflicts` | Run the contradiction pass now (same-category, keep newer). Also runs during clustering. |
+| `list_compression_candidates` | List verbose memories worth rewriting tighter (context economy). |
 | `delete_memory` | Hard-delete a specific memory by ID. |
 | `promote_to_general` | Promote a project-specific memory to the general pool. |
+| `list_promotion_candidates` | List borderline cross-project matches queued for promotion review. |
+| `approve_promotion` | Approve a queued candidate — move it to the general pool (reversible). |
+| `dismiss_promotion` | Dismiss a queued candidate without promoting. |
+| `list_promotions` | The promotion audit log (auto + approved). |
+| `revert_promotion` | Undo a promotion — return the memory to its original project. |
 | `trigger_clustering` | Manually trigger a full clustering pass without waiting for the background debounce. |
 | `wipe_episodic` | Wipe episodic memories for the current project (call on session end). |
 
@@ -113,9 +178,17 @@ Fires when Claude Code opens. Bootstraps CLAUDE.md on first project visit and in
 Fires before every user prompt. Queries the daemon with the prompt text and injects the top 4–5 relevant memories as `additionalContext`. Replaces static session summaries with per-prompt targeted recall — every turn gets the memories most relevant to what you just asked.
 
 **Stop** (`~/.claude/hooks/3am-stop.sh`)
-Fires after every Claude response. Two-pass loop: first pass blocks Claude with a tight extraction prompt ("store anything worth knowing in a future session, then stop"); second pass (`stop_hook_active: true`) passes through. A flag file at `/tmp/3am-stop-{session_id}` prevents infinite loops.
+Fires after every Claude response and is **importance-aware** — it reads the transcript and decides whether to block for extraction based on what just happened, not a blind turn counter:
+- **Correction** in the last user turn (the highest-value moment to learn) → always block, asking Claude to store the *lesson* as an actionable rule.
+- **Work turn** (the response used tools/edits) → block every 2nd such turn (`THREEAM_STOP_EVERY_WORK`, default 2).
+- **Idle / chitchat** → block rarely (`THREEAM_STOP_EVERY_IDLE`, default 5).
 
-**StopSession** (`~/.claude/hooks/3am-session-stop.sh`)
+The follow-up stop (`stop_hook_active: true`) passes through. PreCompact remains the safety net before any context is lost, so this hook can stay light.
+
+**PreCompact** (`~/.claude/hooks/3am-precompact.sh`)
+Fires right before context is compacted — the one moment session detail is actually destroyed. PreCompact supports `decision: block` (but not `additionalContext`), so on **auto**-compaction it blocks once with a prompt to checkpoint in-flight state, then allows it on the retry. A flag file at `/tmp/3am-precompact-{session_id}` guarantees compaction is only blocked once per event, so auto-compaction can never be deadlocked. **Manual** `/compact` is never blocked — it doesn't auto-retry, so blocking it would force the user to run `/compact` twice; the hook checks the payload's `trigger` field and passes manual compaction straight through.
+
+**SessionEnd** (`~/.claude/hooks/3am-session-stop.sh`)
 Fires when the session ends. Triggers a full recluster (incorporating memories stored this session) and wipes episodic memories for the session.
 
 ---
