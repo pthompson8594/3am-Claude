@@ -8,8 +8,9 @@
 #   4. Writes the SessionStart hook to ~/.claude/hooks/
 #   5. Writes the UserPromptSubmit hook to ~/.claude/hooks/
 #   6. Writes the Stop hook to ~/.claude/hooks/
-#   7. Writes the StopSession hook to ~/.claude/hooks/
-#   8. Prints next steps
+#   7. Writes the PreCompact hook to ~/.claude/hooks/
+#   8. Writes the SessionEnd hook to ~/.claude/hooks/
+#   9. Prints next steps
 
 set -euo pipefail
 
@@ -179,29 +180,184 @@ echo "==> UserPromptSubmit hook installed: ${PROMPT_FILE}"
 STOP_EXTRACT_FILE="${HOOKS_DIR}/3am-stop.sh"
 cat > "${STOP_EXTRACT_FILE}" <<'STOPEOF'
 #!/usr/bin/env bash
-# 3am-claude Stop hook — per-turn memory extraction (two-pass)
-# Installed by: install.sh
+# 3am-claude Stop hook -- importance-aware memory extraction
+#
+# Copy to ~/.claude/hooks/3am-stop.sh (install.sh does this automatically).
+#
+# Register in ~/.claude/settings.json:
+#   {
+#     "hooks": {
+#       "Stop": [{
+#         "hooks": [{"type": "command", "command": "~/.claude/hooks/3am-stop.sh", "timeout": 10}]
+#       }]
+#     }
+#   }
+#
+# Why importance-aware (not just every-Nth-turn):
+#
+#   The point of memory is to LEARN -- so a future session avoids mistakes made
+#   here. The single highest-value moment to capture is a CORRECTION (the user
+#   said something was wrong) or a substantive work turn (edits/commands). A blind
+#   turn counter is most likely to miss exactly those. So:
+#
+#     • correction detected in the last user turn → ALWAYS block, ask for the
+#       LESSON (what went wrong, the right approach, why) as a procedural memory.
+#     • the turn did real work (tool use)          → block every 2nd such turn.
+#     • chitchat / no work                          → block rarely (every 5th).
+#
+#   Pass 2 (stop_hook_active: true) always passes through. PreCompact remains the
+#   safety net before any context is lost.
+#
+# Tunables: THREEAM_STOP_EVERY_WORK (default 2), THREEAM_STOP_EVERY_IDLE (5).
 
 PAYLOAD=$(cat 2>/dev/null || echo "{}")
 
-SESSION_ID=$(python3 -c \
-    "import sys, json; d=json.loads(sys.argv[1]); print(d.get('session_id',''))" \
-    "${PAYLOAD}" 2>/dev/null || echo "")
-
-HOOK_ACTIVE=$(python3 -c \
-    "import sys, json; d=json.loads(sys.argv[1]); print('1' if d.get('stop_hook_active') else '0')" \
-    "${PAYLOAD}" 2>/dev/null || echo "0")
+read -r SESSION_ID HOOK_ACTIVE TRANSCRIPT < <(python3 -c '
+import sys, json
+d = json.loads(sys.argv[1])
+print(d.get("session_id",""), "1" if d.get("stop_hook_active") else "0",
+      d.get("transcript_path",""))
+' "${PAYLOAD}" 2>/dev/null || echo "  ")
 
 if [ -z "${SESSION_ID}" ]; then
     exit 0
 fi
 
-FLAG="/tmp/3am-stop-${SESSION_ID}"
-
+# Pass 2: the stop that follows an extraction block -- always allow.
 if [ "${HOOK_ACTIVE}" = "1" ]; then
-    rm -f "${FLAG}"
     exit 0
 fi
+
+# Inspect the transcript: was the last user turn a correction? did this turn work?
+# Emits two flags: "<correction 0|1> <did_work 0|1>". Falls back to "0 1" (treat
+# as a work turn) if the transcript can't be parsed.
+read -r CORRECTION DID_WORK < <(python3 - "${TRANSCRIPT}" <<'PY' 2>/dev/null || echo "0 1"
+import sys, json, re
+path = sys.argv[1] if len(sys.argv) > 1 else ""
+msgs = []
+try:
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try: msgs.append(json.loads(line))
+                except Exception: pass
+except Exception:
+    print("0 1"); sys.exit(0)
+
+def role_of(m): return (m.get("message") or m).get("role") or m.get("type") or ""
+def content_of(m): return (m.get("message") or m).get("content")
+
+last_text, human_idx = "", -1
+for i, m in enumerate(msgs):
+    if role_of(m) != "user":
+        continue
+    c = content_of(m)
+    if isinstance(c, str) and c.strip():
+        last_text, human_idx = c, i
+    elif isinstance(c, list):
+        t = [b.get("text","") for b in c
+             if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
+        if t:
+            last_text, human_idx = " ".join(t), i
+
+did_work = False
+for m in msgs[human_idx+1:]:
+    if role_of(m) == "assistant":
+        c = content_of(m)
+        if isinstance(c, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_use" for b in c):
+            did_work = True
+            break
+
+CORR = re.compile(
+    r"\b(no|nope|actually|wrong|incorrect|that'?s not|that is not|don'?t|stop|"
+    r"undo|revert|you (missed|forgot|broke|misunderstood)|not what|isn'?t right|"
+    r"shouldn'?t|instead of)\b", re.IGNORECASE)
+correction = 1 if (last_text and CORR.search(last_text)) else 0
+print(f"{correction} {1 if did_work else 0}")
+PY
+)
+
+CORRECTION="${CORRECTION:-0}"
+DID_WORK="${DID_WORK:-1}"
+
+COUNT_FILE="/tmp/3am-stop-${SESSION_ID}.count"
+
+# Correction → capture the lesson now, no throttle.
+if [ "${CORRECTION}" = "1" ]; then
+    echo "0" > "${COUNT_FILE}"
+    python3 -c "
+import json
+msg = ('[3am] You were corrected this turn. Store the LESSON so a future session '
+       'avoids it: call store_memory (universe=procedural, priority 4-5) phrased as '
+       'a rule -- \"When <situation>, do <right thing>, NOT <wrong thing>, because '
+       '<reason>\". Make it general (project_id=None) if it applies beyond this repo. '
+       'If a previously stored fact was wrong, use apply_correction/supersede_memory. '
+       'Then stop.')
+print(json.dumps({'decision': 'block', 'reason': msg}))
+"
+    exit 0
+fi
+
+# Otherwise throttle by turn type: work turns captured sooner than idle ones.
+if [ "${DID_WORK}" = "1" ]; then
+    EVERY="${THREEAM_STOP_EVERY_WORK:-2}"
+else
+    EVERY="${THREEAM_STOP_EVERY_IDLE:-5}"
+fi
+
+COUNT=$(cat "${COUNT_FILE}" 2>/dev/null || echo "0")
+case "${COUNT}" in (*[!0-9]*|"") COUNT=0 ;; esac
+COUNT=$((COUNT + 1))
+
+if [ "${COUNT}" -lt "${EVERY}" ]; then
+    echo "${COUNT}" > "${COUNT_FILE}"
+    exit 0
+fi
+
+echo "0" > "${COUNT_FILE}"
+
+python3 -c "
+import json
+msg = ('[3am] Store anything from the last few turns worth knowing in a future '
+       'session -- prioritise LESSONS (a failed approach, a gotcha, what worked) as '
+       'actionable procedural memories, plus any non-obvious facts (declarative). '
+       'Ask: which one sentence would stop a fresh Claude from repeating a mistake '
+       'made here? Store that. If nothing qualifies, output nothing and stop.')
+print(json.dumps({'decision': 'block', 'reason': msg}))
+"
+STOPEOF
+chmod +x "${STOP_EXTRACT_FILE}"
+echo "==> Stop hook installed: ${STOP_EXTRACT_FILE}"
+
+# \u2500\u2500 7. PreCompact hook \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+PRECOMPACT_FILE="${HOOKS_DIR}/3am-precompact.sh"
+cat > "${PRECOMPACT_FILE}" <<'PCEOF'
+#!/usr/bin/env bash
+# 3am-claude PreCompact hook \u2014 flush memory before context is compacted
+# Installed by: install.sh
+# AUTO compaction: blocks once (PreCompact supports decision:block) so Claude can
+# checkpoint in-flight state, then allows it on the retry.
+# MANUAL /compact: passes straight through (it does not auto-retry, so blocking
+# would force the user to run /compact twice).
+
+PAYLOAD=$(cat 2>/dev/null || echo "{}")
+
+read -r SESSION_ID TRIGGER < <(python3 -c \
+    "import sys, json; d=json.loads(sys.argv[1]); print(d.get('session_id',''), d.get('trigger','auto'))" \
+    "${PAYLOAD}" 2>/dev/null || echo "")
+
+if [ -z "${SESSION_ID}" ]; then
+    exit 0
+fi
+
+# Manual /compact: the user asked for it \u2014 don't block, don't double-prompt.
+if [ "${TRIGGER}" = "manual" ]; then
+    exit 0
+fi
+
+FLAG="/tmp/3am-precompact-${SESSION_ID}"
 
 if [ -f "${FLAG}" ]; then
     rm -f "${FLAG}"
@@ -212,18 +368,18 @@ touch "${FLAG}"
 
 python3 -c "
 import json
-msg = '[3am] Without replying, call store_memory for anything from this turn worth knowing in a future session \u2014 what was looked up, decided, or discovered. Then stop.'
+msg = '[3am] Context is about to be compacted \u2014 detail from this session is about to be compressed away. Before it is, call store_memory for anything not yet saved: in-flight task state (universe=episodic), plus any decisions, bugs found, or conventions discovered (declarative/procedural). Once saved, allow the compaction.'
 print(json.dumps({'decision': 'block', 'reason': msg}))
 "
-STOPEOF
-chmod +x "${STOP_EXTRACT_FILE}"
-echo "==> Stop hook installed: ${STOP_EXTRACT_FILE}"
+PCEOF
+chmod +x "${PRECOMPACT_FILE}"
+echo "==> PreCompact hook installed: ${PRECOMPACT_FILE}"
 
-# ── 7. StopSession hook ───────────────────────────────────────────────────────
+# ── 9. SessionEnd hook ────────────────────────────────────────────────────────
 STOP_FILE="${HOOKS_DIR}/3am-session-stop.sh"
 cat > "${STOP_FILE}" <<EOF
 #!/usr/bin/env bash
-# 3am-claude StopSession hook
+# 3am-claude SessionEnd hook
 # Triggers recluster + wipes episodic memories at session end.
 # Installed by: ${SCRIPT_DIR}/install.sh
 
@@ -237,29 +393,43 @@ if [ -z "\${SESSION_ID}" ]; then
     exit 0
 fi
 
+# Clean up per-session scratch files left by the Stop / PreCompact hooks.
+rm -f "/tmp/3am-stop-\${SESSION_ID}" "/tmp/3am-stop-\${SESSION_ID}.count" \\
+      "/tmp/3am-precompact-\${SESSION_ID}" 2>/dev/null || true
+
 curl -sf --max-time 5 \\
     -X POST \\
     "http://127.0.0.1:${PORT}/api/session-stop?session_id=\${SESSION_ID}" \\
     >/dev/null 2>&1 || true
 EOF
 chmod +x "${STOP_FILE}"
-echo "==> StopSession hook installed: ${STOP_FILE}"
+echo "==> SessionEnd hook installed: ${STOP_FILE}"
 
-# ── 8. Next steps ─────────────────────────────────────────────────────────────
+# ── 9b. Skills ────────────────────────────────────────────────────────────────
+# Install bundled Claude Code skills (user scope, apply across all projects).
+if [ -d "${SCRIPT_DIR}/skills" ]; then
+    SKILLS_DIR="${HOME}/.claude/skills"
+    mkdir -p "${SKILLS_DIR}"
+    for skill in "${SCRIPT_DIR}/skills"/*/; do
+        [ -d "$skill" ] || continue
+        name="$(basename "$skill")"
+        mkdir -p "${SKILLS_DIR}/${name}"
+        cp -r "${skill}." "${SKILLS_DIR}/${name}/"
+        echo "==> Skill installed: ${SKILLS_DIR}/${name}"
+    done
+fi
+
+# ── 10. Next steps ────────────────────────────────────────────────────────────
 echo ""
 echo "==> Next steps:"
 echo ""
-echo "  1. Register the MCP server in ~/.claude/settings.json:"
-echo '     {'
-echo '       "mcpServers": {'
-echo '         "3am": {'
-echo '           "type": "http",'
-echo "           \"url\": \"http://127.0.0.1:${PORT}/mcp\""
-echo '         }'
-echo '       }'
-echo '     }'
+echo "  1. Register the MCP server (NOT in settings.json — MCP lives in ~/.claude.json):"
+echo "       claude mcp add --transport http --scope user 3am http://127.0.0.1:${PORT}/mcp"
 echo ""
-echo "  2. Register the hooks in ~/.claude/settings.json:"
+echo "     Or, with no 'claude' CLI on PATH, add to ~/.claude.json under top-level"
+echo "     \"mcpServers\": { \"3am\": { \"type\": \"http\", \"url\": \"http://127.0.0.1:${PORT}/mcp\" } }"
+echo ""
+echo "  2. Register the hooks in ~/.claude/settings.json (hooks ARE read from here):"
 echo '     {'
 echo '       "hooks": {'
 echo '         "SessionStart": [{'
@@ -271,7 +441,10 @@ echo '         }],'
 echo '         "Stop": [{'
 echo '           "hooks": [{"type": "command", "command": "'"${STOP_EXTRACT_FILE}"'", "timeout": 10}]'
 echo '         }],'
-echo '         "StopSession": [{'
+echo '         "PreCompact": [{'
+echo '           "hooks": [{"type": "command", "command": "'"${PRECOMPACT_FILE}"'", "timeout": 10}]'
+echo '         }],'
+echo '         "SessionEnd": [{'
 echo '           "hooks": [{"type": "command", "command": "'"${STOP_FILE}"'", "timeout": 15}]'
 echo '         }]'
 echo '       }'
@@ -283,5 +456,8 @@ if command -v systemctl &>/dev/null && systemctl --user status &>/dev/null 2>&1;
 else
     echo "     ${VENV}/bin/uvicorn mcp_server:app --host 127.0.0.1 --port ${PORT} &"
 fi
+echo ""
+echo "  4. Open the memory map (optional):"
+echo "     http://127.0.0.1:${PORT}/ui"
 echo ""
 echo "==> Install complete."
