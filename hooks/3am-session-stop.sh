@@ -35,9 +35,10 @@ if [ -z "${SESSION_ID}" ]; then
     exit 0
 fi
 
-# Clean up per-session scratch files left by the Stop / PreCompact hooks.
+# Clean up per-session scratch files left by the Stop / PreCompact / recall hooks.
 rm -f "/tmp/3am-stop-${SESSION_ID}" "/tmp/3am-stop-${SESSION_ID}.count" \
-      "/tmp/3am-precompact-${SESSION_ID}" 2>/dev/null || true
+      "/tmp/3am-precompact-${SESSION_ID}" "/tmp/3am-recall-seen-${SESSION_ID}" \
+      2>/dev/null || true
 
 curl -sf --max-time 5 \
     -X POST \

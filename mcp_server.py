@@ -651,6 +651,16 @@ class _SessionContextApp:
         if not project_clusters and not general_clusters:
             lines.append("No memories stored yet for this project.")
 
+        # Standing behavioral rule (global — ships with the daemon, applies in every
+        # project regardless of any per-repo CLAUDE.md). Tool-recall hooks surface
+        # memories automatically as you work, but this is the fallback discipline.
+        lines.append(
+            "**Recall discipline:** memories are injected on each prompt and as you "
+            "touch files/run commands, but if your reasoning turns to a subtopic that "
+            "feels familiar and nothing relevant was surfaced, call `query_memory` "
+            "before acting — don't assume the start-of-turn injection covered it."
+        )
+
         resp = JSONResponse({
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
@@ -720,6 +730,56 @@ class _PromptContextApp:
             lines.append(f"- [{m['universe']}{age_tag}] {m['content']}")
 
         resp = JSONResponse({"additionalContext": "\n".join(lines)})
+        await resp(scope, receive, send)
+
+
+class _RecallApp:
+    """
+    Minimal ASGI handler for POST /api/recall
+
+    Action-triggered recall: the tool-recall hook calls this after (or before) a
+    tool runs, with a query derived from what Claude is doing (the file it touched,
+    the search pattern, the command, plus a snippet of its reasoning). Returns
+    STRUCTURED hits with ids so the hook can dedup against its per-session seen-set
+    and inject only memories not already shown.
+
+    Body (JSON):
+      project_id — sha256[:16] of git root (may be null)
+      query      — derived activity signal
+      limit      — max hits (default 4)
+      min_score  — relevance floor (default 0.10 — higher than prompt recall, since
+                   this fires constantly and must stay quiet unless clearly relevant)
+    """
+
+    async def __call__(self, scope, receive, send):
+        request = Request(scope, receive)
+        if _memory is None:
+            resp = JSONResponse({"hits": []}, status_code=503)
+            await resp(scope, receive, send)
+            return
+        try:
+            body = await request.json()
+        except Exception:
+            resp = JSONResponse({"hits": []}, status_code=400)
+            await resp(scope, receive, send)
+            return
+
+        project_id = body.get("project_id") or None
+        query = (body.get("query") or "").strip()
+        limit = min(int(body.get("limit", 4)), 8)
+        min_cosine = float(body.get("min_cosine", _memory.recall_min_cosine))
+        if len(query) < 3:
+            resp = JSONResponse({"hits": []})
+            await resp(scope, receive, send)
+            return
+
+        hits = await _memory.recall_precise(
+            query=query,
+            project_id=project_id,
+            min_cosine=min_cosine,
+            limit=limit,
+        )
+        resp = JSONResponse({"hits": hits})
         await resp(scope, receive, send)
 
 
@@ -830,6 +890,7 @@ class _CompositeApp:
         self._session_ctx = _SessionContextApp()
         self._prompt_ctx = _PromptContextApp()
         self._session_stop = _SessionStopApp()
+        self._recall = _RecallApp()
         self._ui = _UIApp()
 
     async def __call__(self, scope, receive, send):
@@ -842,6 +903,8 @@ class _CompositeApp:
             await self._prompt_ctx(scope, receive, send)
         elif scope["type"] == "http" and path == "/api/session-stop":
             await self._session_stop(scope, receive, send)
+        elif scope["type"] == "http" and path == "/api/recall":
+            await self._recall(scope, receive, send)
         elif scope["type"] == "http" and (path == "/ui" or path == "/ui/" or path.startswith("/api/ui/")):
             await self._ui(scope, receive, send)
         elif scope["type"] == "http" and scope.get("path") == "/health":

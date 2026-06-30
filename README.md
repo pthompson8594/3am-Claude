@@ -191,6 +191,9 @@ Fires right before context is compacted — the one moment session detail is act
 **SessionEnd** (`~/.claude/hooks/3am-session-stop.sh`)
 Fires when the session ends. Triggers a full recluster (incorporating memories stored this session) and wipes episodic memories for the session.
 
+**PreToolUse + PostToolUse** (`~/.claude/hooks/3am-recall.sh` → `hooks/recall_hook.py`)
+**Action-triggered recall.** Standard recall is *input*-triggered — memories are matched against your prompt. But mid-task Claude's reasoning drifts to subtopics the prompt never mentioned, and the relevant memory is missed. This hook makes recall follow what Claude is *doing*: before an Edit/Write and after a Read/Edit/Grep, it derives a signal from the activity (the code being changed, the file, the search pattern) and surfaces relevant memories — so a stored lesson appears exactly when Claude reaches for the thing it's about (e.g. editing the stop hook surfaces the stop-hook lesson). To stay quiet, it uses a **precision** retrieval path (`recall_precise`: pure vector cosine gate, no FTS/PPR — the opposite tuning from prompt recall), a per-session **seen-set** so no memory is injected twice, and it skips orientation memories already in the session context. `recall_min_cosine` (default `0.60`) is the relevance gate; raise it for fewer, surer hits.
+
 ---
 
 ## CLI
@@ -220,6 +223,7 @@ Copy `config.default.json` to `~/.local/share/3am-claude/config.json` and edit:
   "code_snippet_ttl_days": 7,
   "debounce_seconds": 10,
   "min_cosine": 0.5,
+  "recall_min_cosine": 0.60,
   "llm_url": "http://localhost:8080"
 }
 ```

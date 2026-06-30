@@ -382,6 +382,19 @@ PCEOF
 chmod +x "${PRECOMPACT_FILE}"
 echo "==> PreCompact hook installed: ${PRECOMPACT_FILE}"
 
+# ── 8b. Tool-recall hook (action-triggered recall) ────────────────────────────
+# Thin wrapper that execs the version-controlled recall_hook.py with this repo's
+# venv + path. Registered for BOTH PreToolUse and PostToolUse.
+RECALL_FILE="${HOOKS_DIR}/3am-recall.sh"
+cat > "${RECALL_FILE}" <<EOF
+#!/usr/bin/env bash
+# 3am-claude tool-recall hook — action-triggered memory recall (PreToolUse + PostToolUse).
+# Installed by: ${SCRIPT_DIR}/install.sh
+exec "${VENV}/bin/python" "${SCRIPT_DIR}/hooks/recall_hook.py" "${PORT}" "${SCRIPT_DIR}"
+EOF
+chmod +x "${RECALL_FILE}"
+echo "==> Tool-recall hook installed: ${RECALL_FILE}"
+
 # ── 9. SessionEnd hook ────────────────────────────────────────────────────────
 STOP_FILE="${HOOKS_DIR}/3am-session-stop.sh"
 cat > "${STOP_FILE}" <<EOF
@@ -400,9 +413,10 @@ if [ -z "\${SESSION_ID}" ]; then
     exit 0
 fi
 
-# Clean up per-session scratch files left by the Stop / PreCompact hooks.
+# Clean up per-session scratch files left by the Stop / PreCompact / recall hooks.
 rm -f "/tmp/3am-stop-\${SESSION_ID}" "/tmp/3am-stop-\${SESSION_ID}.count" \\
-      "/tmp/3am-precompact-\${SESSION_ID}" 2>/dev/null || true
+      "/tmp/3am-precompact-\${SESSION_ID}" "/tmp/3am-recall-seen-\${SESSION_ID}" \\
+      2>/dev/null || true
 
 curl -sf --max-time 5 \\
     -X POST \\
@@ -453,6 +467,14 @@ echo '           "hooks": [{"type": "command", "command": "'"${PRECOMPACT_FILE}"
 echo '         }],'
 echo '         "SessionEnd": [{'
 echo '           "hooks": [{"type": "command", "command": "'"${STOP_FILE}"'", "timeout": 15}]'
+echo '         }],'
+echo '         "PreToolUse": [{'
+echo '           "matcher": "Edit|Write|MultiEdit",'
+echo '           "hooks": [{"type": "command", "command": "'"${RECALL_FILE}"'", "timeout": 8}]'
+echo '         }],'
+echo '         "PostToolUse": [{'
+echo '           "matcher": "Read|Edit|Write|MultiEdit|Grep|Glob",'
+echo '           "hooks": [{"type": "command", "command": "'"${RECALL_FILE}"'", "timeout": 8}]'
 echo '         }]'
 echo '       }'
 echo '     }'

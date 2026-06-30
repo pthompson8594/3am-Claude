@@ -314,6 +314,7 @@ class MemorySystem:
         self.promote_candidate_cosine = float(_cfg.get("promote_candidate_cosine", PROMOTE_CANDIDATE_COSINE))
         self.promote_min_projects    = int(_cfg.get("promote_min_projects", PROMOTE_MIN_PROJECTS))
         self.conflict_detection      = _cfg.get("conflict_detection", True)
+        self.recall_min_cosine       = float(_cfg.get("recall_min_cosine", 0.62))
 
         self.memories: dict[str, MemoryEntry] = {}
         self.clusters: dict[str, MemoryCluster] = {}
@@ -1123,6 +1124,60 @@ class MemorySystem:
                     break
 
         return results
+
+    async def recall_precise(
+        self,
+        query: str,
+        project_id: Optional[str],
+        min_cosine: float = 0.6,
+        limit: int = 4,
+    ) -> list:
+        """
+        Precision-oriented retrieval for ACTION-triggered recall (the tool hooks).
+
+        Unlike query_memory (hybrid FTS5+vec+PPR, tuned for *recall* so the prompt
+        injection surfaces anything plausibly relevant), this is tuned for
+        *precision*: pure vector nearest-neighbor, gated on raw cosine similarity,
+        no FTS and no PPR. It fires on every matched tool call, so it must stay
+        silent unless a memory is genuinely close to what Claude is doing — keyword
+        overlap on code tokens must NOT qualify. Returns [] for weak/ambiguous hits.
+        """
+        if not self.memories:
+            return []
+        conn = self._get_conn()
+        embedding = await self.embedder.embed(query)
+        emb_bytes = np.array(embedding, dtype=np.float32).tobytes()
+        rows = conn.execute("""
+            SELECT memory_id, distance FROM vec_memories
+            WHERE embedding MATCH ? ORDER BY distance LIMIT ?
+        """, (emb_bytes, limit * 5)).fetchall()
+        out = []
+        now = time.time()
+        for r in rows:
+            mid = r["memory_id"]
+            entry = self.memories.get(mid)
+            if not entry or entry.superseded_by:
+                continue
+            if not self._is_visible(mid, project_id):
+                continue
+            # Skip orientation memories already in the session context (ingested
+            # CLAUDE.md) — action-recall should surface specific lessons, not the
+            # generic project overview, which would otherwise match every file edit.
+            if "source:CLAUDE.md" in (entry.tags or []):
+                continue
+            cosine = 1.0 - r["distance"]
+            if cosine < min_cosine:
+                continue
+            out.append({
+                "id": entry.id,
+                "universe": entry.universe,
+                "age": _humanize_age(entry.timestamp, now),
+                "content": entry.content,
+                "cosine": round(cosine, 4),
+            })
+            if len(out) >= limit:
+                break
+        return out
 
     async def get_session_summary(self, project_id: Optional[str]) -> list:
         """
