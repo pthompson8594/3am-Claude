@@ -21,5 +21,12 @@
   "temporal_locality_days": 7,
   "temporal_locality_bonus": 0.05,
 
-  "min_cosine": 0.5
+  "min_cosine": 0.5,
+
+  "auto_promote": true,
+  "promote_auto_cosine": 0.90,
+  "promote_candidate_cosine": 0.82,
+  "promote_min_projects": 2,
+
+  "conflict_detection": true
 }

@@ -37,6 +37,17 @@ import sqlite_vec
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 DEDUP_DISTANCE               = 1.0 - 0.92   # 0.08 — identical fact, skip
+
+# Auto-promotion thresholds (cosine similarity). When a newly stored project
+# memory closely matches memories that exist in OTHER projects, the knowledge is
+# general rather than project-local — a candidate for the shared general pool.
+# Recall never crosses projects (see _is_visible), so store-time cross-project
+# similarity is the only viable promotion signal.
+PROMOTE_AUTO_COSINE          = 0.90   # >= → auto-promote (near-identical)
+PROMOTE_CANDIDATE_COSINE     = 0.82   # >= (and < auto) → queue for confirmation
+PROMOTE_MIN_PROJECTS         = 2      # distinct projects the concept must span
+PROMOTE_SCAN_LIMIT           = 15     # nearest neighbors to inspect at store time
+
 CLUSTER_HEALTH_THRESHOLD     = 0.35
 MESSAGE_RETENTION_THRESHOLD  = 0.35
 MIN_MEMORIES_FOR_CLUSTERING  = 5
@@ -54,7 +65,50 @@ UNIVERSE_DECAY_MULTIPLIERS = {
     "procedural":  0.1,   # very slow decay — only replaced by better patterns
 }
 
+# Category-aware decay (ported from 3am-AI). Stable facts (who you are, what you
+# prefer) resist decay; time-bound facts (a project, an activity) fade normally.
+# Applied on top of universe + priority rates. Unknown categories → 1.0.
+CATEGORY_DECAY_MULTIPLIERS = {
+    "identity":    0.1,   # who you are — near-permanent
+    "preferences": 0.2,   # tastes change slowly
+    "relationship":0.3,
+    "projects":    1.0,   # time-bounded — normal decay
+    "activities":  1.0,   # time-bound — normal decay
+    "general":     1.0,
+}
+VALID_CATEGORIES = set(CATEGORY_DECAY_MULTIPLIERS) | {"research", "skill"}
+
+# Superseded memories fade fast (10×) but aren't hard-deleted — audit trail.
+SUPERSEDED_DECAY_MULT = 10.0
+
+# Auto conflict detection (ported from 3am-AI): same-category neighbors whose
+# distance falls in this band are "close but not identical" → potential conflict.
+CONFLICT_DIST_NEAR = DEDUP_DISTANCE          # 0.08 — closer = duplicate
+CONFLICT_DIST_FAR  = 1.0 - 0.75              # 0.25 — further = different topic
+CONFLICT_SCAN_LIMIT = 20
+
+# Similarity gate for matching a free-text "wrong claim" to an existing memory.
+CORRECTION_MATCH_COSINE = 0.65
+
 CHARS_PER_TOKEN = 4  # rough approximation for max_tokens budget
+
+# ── Temporal query detection (time-grounded retrieval) ────────────────────────
+_TEMPORAL_PATTERNS = re.compile(
+    r"\b(when|what year|what month|what day|what time|how long ago|since when|"
+    r"before|after|earlier|later|first time|last time|recently|"
+    r"date of|day did|year did|month did)\b",
+    re.IGNORECASE,
+)
+_MONTHS = ("january", "february", "march", "april", "may", "june", "july",
+           "august", "september", "october", "november", "december")
+
+
+def _is_temporal_query(query: str) -> bool:
+    """True if the question is asking about time ('when did X', 'before Y')."""
+    q = query.lower()
+    if _TEMPORAL_PATTERNS.search(q):
+        return True
+    return any(m in q for m in _MONTHS)
 
 # Per-universe retrieval fractions by query type (episodic, declarative, procedural).
 # Applied as soft caps on the result set — keeps context balanced for the query intent.
@@ -106,11 +160,14 @@ class MemoryEntry:
     universe: str                # episodic | declarative | procedural
     priority: int
     tags: list
-    timestamp: float
+    timestamp: float             # store time (when this was written)
     ttl_expires: Optional[float] # None = permanent
     cluster_id: Optional[str]
     access_count: int
     last_accessed: float
+    event_time: Optional[float] = None   # when the fact is ABOUT (for temporal recall); None → use timestamp
+    category: str = "general"            # identity|preferences|projects|activities|… (decay-aware)
+    superseded_by: Optional[str] = None  # id of the memory that replaced this one
 
 
 @dataclass
@@ -223,6 +280,14 @@ class MemorySystem:
         self.llm_url = llm_url
         self.clustering_config_dict = clustering_config or {}
 
+        # Auto-promotion config (overridable via config.json)
+        _cfg = clustering_config or {}
+        self.auto_promote            = _cfg.get("auto_promote", True)
+        self.promote_auto_cosine     = float(_cfg.get("promote_auto_cosine", PROMOTE_AUTO_COSINE))
+        self.promote_candidate_cosine = float(_cfg.get("promote_candidate_cosine", PROMOTE_CANDIDATE_COSINE))
+        self.promote_min_projects    = int(_cfg.get("promote_min_projects", PROMOTE_MIN_PROJECTS))
+        self.conflict_detection      = _cfg.get("conflict_detection", True)
+
         self.memories: dict[str, MemoryEntry] = {}
         self.clusters: dict[str, MemoryCluster] = {}
         self._clustering_dirty = False
@@ -280,7 +345,10 @@ class MemorySystem:
                 ttl_expires   REAL,
                 cluster_id    TEXT,
                 access_count  INTEGER NOT NULL DEFAULT 0,
-                last_accessed REAL NOT NULL DEFAULT 0
+                last_accessed REAL NOT NULL DEFAULT 0,
+                event_time    REAL,
+                category      TEXT NOT NULL DEFAULT 'general',
+                superseded_by TEXT
             );
 
             CREATE TABLE IF NOT EXISTS clusters (
@@ -307,12 +375,49 @@ class MemorySystem:
                 PRIMARY KEY (source_id, target_id)
             );
 
+            -- Auto-promotion audit log: every project→general promotion, reversible.
+            CREATE TABLE IF NOT EXISTS promotions (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id        TEXT NOT NULL,
+                original_project TEXT,
+                projects         TEXT NOT NULL DEFAULT '[]',
+                match_ids        TEXT NOT NULL DEFAULT '[]',
+                best_cosine      REAL NOT NULL DEFAULT 0,
+                timestamp        REAL NOT NULL,
+                trigger          TEXT NOT NULL DEFAULT 'auto',
+                reverted         INTEGER NOT NULL DEFAULT 0
+            );
+
+            -- Queue of borderline promotion candidates awaiting confirmation.
+            CREATE TABLE IF NOT EXISTS promotion_candidates (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id   TEXT NOT NULL,
+                match_ids   TEXT NOT NULL DEFAULT '[]',
+                projects    TEXT NOT NULL DEFAULT '[]',
+                best_cosine REAL NOT NULL DEFAULT 0,
+                timestamp   REAL NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'pending'
+            );
+
             CREATE INDEX IF NOT EXISTS idx_links_source   ON memory_links(source_id);
             CREATE INDEX IF NOT EXISTS idx_links_target   ON memory_links(target_id);
             CREATE INDEX IF NOT EXISTS idx_mem_project    ON memories(project_id);
             CREATE INDEX IF NOT EXISTS idx_mem_session    ON memories(session_id);
             CREATE INDEX IF NOT EXISTS idx_mem_universe   ON memories(universe);
+            CREATE INDEX IF NOT EXISTS idx_cand_status    ON promotion_candidates(status);
         """)
+
+        # Migrate older DBs: add columns introduced after first release.
+        existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(memories)")}
+        for col, ddl in (
+            ("event_time",    "ALTER TABLE memories ADD COLUMN event_time REAL"),
+            ("category",      "ALTER TABLE memories ADD COLUMN category TEXT NOT NULL DEFAULT 'general'"),
+            ("superseded_by", "ALTER TABLE memories ADD COLUMN superseded_by TEXT"),
+        ):
+            if col not in existing_cols:
+                conn.execute(ddl)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_superseded ON memories(superseded_by)")
+        conn.commit()
 
         conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
@@ -344,7 +449,8 @@ class MemorySystem:
 
         for row in conn.execute(
             "SELECT id, content, project_id, session_id, universe, priority, tags, "
-            "timestamp, ttl_expires, cluster_id, access_count, last_accessed FROM memories"
+            "timestamp, ttl_expires, cluster_id, access_count, last_accessed, "
+            "event_time, category, superseded_by FROM memories"
         ):
             try:
                 tags = json.loads(row["tags"] or "[]")
@@ -363,6 +469,9 @@ class MemorySystem:
                 cluster_id=row["cluster_id"],
                 access_count=row["access_count"] or 0,
                 last_accessed=row["last_accessed"] or 0.0,
+                event_time=row["event_time"],
+                category=row["category"] or "general",
+                superseded_by=row["superseded_by"],
             )
 
         for row in conn.execute(
@@ -436,8 +545,12 @@ class MemorySystem:
         age_hours = (current_time - entry.timestamp) / 3600
         base_rate = DECAY_RATES.get(entry.priority, DECAY_RATES[1])
         universe_mult = UNIVERSE_DECAY_MULTIPLIERS.get(entry.universe, 1.0)
+        category_mult = CATEGORY_DECAY_MULTIPLIERS.get(entry.category, 1.0)
         access_resistance = 1.0 / (1.0 + entry.access_count)
-        effective_rate = base_rate * universe_mult * access_resistance
+        # Superseded memories fade fast — replaced by a newer/corrected fact.
+        superseded_mult = SUPERSEDED_DECAY_MULT if entry.superseded_by else 1.0
+        effective_rate = (base_rate * universe_mult * category_mult
+                          * access_resistance * superseded_mult)
         return math.exp(-effective_rate * age_hours)
 
     # ── DB helpers ────────────────────────────────────────────────────────────
@@ -460,13 +573,15 @@ class MemorySystem:
             conn.execute("""
                 INSERT OR REPLACE INTO memories
                 (id, content, project_id, session_id, universe, priority, tags,
-                 timestamp, ttl_expires, cluster_id, access_count, last_accessed)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 timestamp, ttl_expires, cluster_id, access_count, last_accessed,
+                 event_time, category, superseded_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 entry.id, _e(entry.content), entry.project_id, entry.session_id,
                 entry.universe, entry.priority, json.dumps(entry.tags),
                 entry.timestamp, entry.ttl_expires, entry.cluster_id,
                 entry.access_count, entry.last_accessed,
+                entry.event_time, entry.category, entry.superseded_by,
             ))
             conn.execute("DELETE FROM vec_memories WHERE memory_id=?", (entry.id,))
             conn.execute(
@@ -586,13 +701,25 @@ class MemorySystem:
         tags: Optional[list] = None,
         ttl_days: Optional[int] = None,
         session_id: Optional[str] = None,
+        event_time: Optional[float] = None,
+        category: str = "general",
+        skip_dedup: bool = False,
     ) -> dict:
         """
         Store a memory. Returns {id, cluster_theme}.
-        Deduplicates within project scope.
+        Deduplicates within project scope (unless skip_dedup — used by supersede/
+        correction paths, where the new fact may be near-identical to the old one
+        it replaces and must not be merged back into it).
+
+        event_time: epoch seconds the fact is ABOUT (e.g. when an event happened),
+                    for time-grounded recall. None → falls back to store time.
+        category:   identity|preferences|projects|activities|general|… — drives
+                    category-aware decay (stable facts resist decay).
         """
         if universe not in VALID_UNIVERSES:
             universe = "episodic"
+        if category not in VALID_CATEGORIES:
+            category = "general"
         priority = max(1, min(5, priority))
         tags = tags or []
 
@@ -602,7 +729,7 @@ class MemorySystem:
 
         # Dedup check: nearest neighbor within distance threshold
         # sqlite-vec requires LIMIT on the vec0 table directly (inside subquery)
-        row = conn.execute("""
+        row = None if skip_dedup else conn.execute("""
             SELECT sub.memory_id, sub.distance, m.project_id
             FROM (
                 SELECT memory_id, distance
@@ -644,6 +771,9 @@ class MemorySystem:
             cluster_id=None,
             access_count=0,
             last_accessed=0.0,
+            event_time=event_time,
+            category=category,
+            superseded_by=None,
         )
         self.memories[entry_id] = entry
         await self._write_memory(entry, embedding)
@@ -676,7 +806,111 @@ class MemorySystem:
 
         self._clustering_dirty = True
         self.stats["total_memories"] = len(self.memories)
-        return {"id": entry_id, "cluster_theme": cluster_theme}
+
+        result = {"id": entry_id, "cluster_theme": cluster_theme}
+
+        # Hybrid auto-promotion: if this project memory mirrors knowledge already
+        # present in other projects, promote it (high confidence) or queue it
+        # (borderline). Only declarative/procedural — episodic is transient.
+        if entry.project_id is not None and universe in ("declarative", "procedural"):
+            promo = await self._evaluate_promotion(entry, embedding)
+            if promo:
+                result["promotion"] = promo
+
+        return result
+
+    # ── Auto-promotion ──────────────────────────────────────────────────────────
+
+    async def _evaluate_promotion(self, entry: "MemoryEntry", embedding) -> Optional[dict]:
+        """
+        Decide whether a freshly-stored project memory should move to the general
+        pool, based on how closely it matches memories from OTHER projects.
+
+          best cross-project cosine >= promote_auto_cosine, spanning >= N projects
+            → auto-promote (if auto_promote enabled) else queue
+          >= promote_candidate_cosine
+            → queue as a candidate for confirmation
+
+        Returns a small dict describing the action, or None if nothing fired.
+        """
+        conn = self._get_conn()
+        emb_bytes = np.array(embedding, dtype=np.float32).tobytes()
+        rows = conn.execute("""
+            SELECT sub.memory_id, sub.distance, m.project_id
+            FROM (
+                SELECT memory_id, distance
+                FROM vec_memories
+                WHERE embedding MATCH ?
+                ORDER BY distance
+                LIMIT ?
+            ) sub
+            JOIN memories m ON m.id = sub.memory_id
+        """, (emb_bytes, PROMOTE_SCAN_LIMIT)).fetchall()
+
+        # Cross-project neighbors only (different non-null project than this entry).
+        matches = []  # (memory_id, cosine, project_id)
+        for r in rows:
+            if r["memory_id"] == entry.id:
+                continue
+            proj = r["project_id"]
+            if proj is None or proj == entry.project_id:
+                continue
+            cosine = 1.0 - r["distance"]
+            if cosine >= self.promote_candidate_cosine:
+                matches.append((r["memory_id"], cosine, proj))
+
+        if not matches:
+            return None
+
+        best_cosine = max(c for _, c, _ in matches)
+        distinct_projects = {entry.project_id} | {p for _, _, p in matches}
+        if len(distinct_projects) < self.promote_min_projects:
+            return None
+
+        match_ids = [mid for mid, _, _ in matches]
+        projects = sorted(distinct_projects)
+        now = time.time()
+
+        if best_cosine >= self.promote_auto_cosine and self.auto_promote:
+            # Auto-promote this entry to the general pool. We move only this entry
+            # (not the matched originals) — fully reversible via revert_promotion.
+            original_project = entry.project_id
+            entry.project_id = None
+            async with self._get_lock():
+                conn.execute("UPDATE memories SET project_id=NULL WHERE id=?", (entry.id,))
+                conn.execute("""
+                    INSERT INTO promotions
+                        (memory_id, original_project, projects, match_ids,
+                         best_cosine, timestamp, trigger, reverted)
+                    VALUES (?, ?, ?, ?, ?, ?, 'auto', 0)
+                """, (entry.id, original_project, json.dumps(projects),
+                      json.dumps(match_ids), best_cosine, now))
+                conn.commit()
+            return {
+                "action": "promoted",
+                "best_cosine": round(best_cosine, 4),
+                "projects": projects,
+            }
+
+        # Borderline (or auto disabled): queue for confirmation, de-duping pending.
+        async with self._get_lock():
+            existing = conn.execute(
+                "SELECT id FROM promotion_candidates WHERE memory_id=? AND status='pending'",
+                (entry.id,),
+            ).fetchone()
+            if not existing:
+                conn.execute("""
+                    INSERT INTO promotion_candidates
+                        (memory_id, match_ids, projects, best_cosine, timestamp, status)
+                    VALUES (?, ?, ?, ?, ?, 'pending')
+                """, (entry.id, json.dumps(match_ids), json.dumps(projects),
+                      best_cosine, now))
+                conn.commit()
+        return {
+            "action": "queued",
+            "best_cosine": round(best_cosine, 4),
+            "projects": projects,
+        }
 
     async def query_memory(
         self,
@@ -699,39 +933,48 @@ class MemorySystem:
         embedding = await self.embedder.embed(query)
         emb_bytes = np.array(embedding, dtype=np.float32).tobytes()
 
-        # FTS5 seeds — post-filter by project visibility
+        # Time-grounded retrieval: temporal questions ("when did X") widen the
+        # retrieval beam — the supporting turn is often outside a narrow top-k.
+        temporal = _is_temporal_query(query)
+        cand_limit = 40 if temporal else 20
+        seed_keep  = 16 if temporal else 8
+
+        # FTS5 seeds — drop stopwords + time-question words so real terms drive
+        # the match; post-filter by project visibility and supersession.
         fts_seeds: list = []
-        fts_query = " OR ".join(
-            f'"{w}"' for w in query.split()[:8] if len(w) > 2
-        )
+        fts_terms = [w for w in re.findall(r"[A-Za-z0-9']+", query)
+                     if len(w) > 2 and w.lower() not in _STOPWORDS]
+        fts_query = " OR ".join(f'"{w}"' for w in fts_terms[:10])
         if fts_query:
             try:
                 fts_rows = conn.execute("""
                     SELECT memory_id, rank FROM fts_memories
                     WHERE fts_memories MATCH ?
                     ORDER BY rank
-                    LIMIT 20
-                """, (fts_query,)).fetchall()
+                    LIMIT ?
+                """, (fts_query, cand_limit)).fetchall()
                 fts_seeds = [
                     r["memory_id"] for r in fts_rows
                     if r["memory_id"] in self.memories
                     and self._is_visible(r["memory_id"], project_id)
-                ][:8]
+                    and not self.memories[r["memory_id"]].superseded_by
+                ][:seed_keep]
             except Exception:
                 pass
 
-        # Vec seeds — post-filter by project visibility
+        # Vec seeds — post-filter by project visibility and supersession
         vec_rows = conn.execute("""
             SELECT memory_id, distance FROM vec_memories
             WHERE embedding MATCH ?
             ORDER BY distance
-            LIMIT 20
-        """, (emb_bytes,)).fetchall()
+            LIMIT ?
+        """, (emb_bytes, cand_limit)).fetchall()
         vec_seeds = [
             r["memory_id"] for r in vec_rows
             if r["memory_id"] in self.memories
             and self._is_visible(r["memory_id"], project_id)
-        ][:8]
+            and not self.memories[r["memory_id"]].superseded_by
+        ][:seed_keep]
 
         # Cosine seed gate: if the best cosine similarity is below min_cosine,
         # PPR would only amplify noise — bail out before graph expansion.
@@ -755,8 +998,9 @@ class MemorySystem:
                 "SELECT COUNT(*) FROM memory_links LIMIT 1"
             ).fetchone()[0] > 0
 
+        ppr_topk = limit + (15 if temporal else 6)
         if self._lanes_ready:
-            ranked = self._ppr_expand(seed_ids, project_id, top_k=limit + 6)
+            ranked = self._ppr_expand(seed_ids, project_id, top_k=ppr_topk)
         else:
             ranked = [(sid, 1.0) for sid in seed_ids]
 
@@ -787,24 +1031,20 @@ class MemorySystem:
         universe_counts: dict = {"episodic": 0, "declarative": 0, "procedural": 0}
 
         results = []
+        chosen: set = set()
         token_count = 0
-        for memory_id, score in ranked:
-            if score < min_score:
-                continue
-            entry = self.memories.get(memory_id)
-            if not entry:
-                continue
-            u = entry.universe
-            if universe_counts.get(u, 0) >= universe_caps.get(u, limit):
-                continue
+
+        def _emit(entry, score) -> bool:
+            """Append a result; returns False if the token budget is exhausted."""
+            nonlocal token_count
             cluster_theme = "General"
             if entry.cluster_id and entry.cluster_id in self.clusters:
                 cluster_theme = self.clusters[entry.cluster_id].theme
             entry_tokens = max(1, len(entry.content) // CHARS_PER_TOKEN)
             if token_count + entry_tokens > max_tokens and results:
-                break
+                return False
             token_count += entry_tokens
-            universe_counts[u] = universe_counts.get(u, 0) + 1
+            chosen.add(entry.id)
             results.append({
                 "id": entry.id,
                 "content": entry.content,
@@ -814,9 +1054,44 @@ class MemorySystem:
                 "project_id": entry.project_id,
                 "tags": entry.tags,
                 "priority": entry.priority,
+                "category": entry.category,
+                "event_time": entry.event_time,
+                "timestamp": entry.timestamp,
             })
+            return True
+
+        # Pass 1: respect per-universe caps (keeps context balanced for intent).
+        budget_left = True
+        for memory_id, score in ranked:
+            if score < min_score:
+                continue
+            entry = self.memories.get(memory_id)
+            if not entry or entry.superseded_by:   # newer/corrected facts win
+                continue
+            u = entry.universe
+            if universe_counts.get(u, 0) >= universe_caps.get(u, limit):
+                continue
+            if not _emit(entry, score):
+                budget_left = False
+                break
+            universe_counts[u] = universe_counts.get(u, 0) + 1
             if len(results) >= limit:
                 break
+
+        # Pass 2 (soft caps): backfill unused slots ignoring caps — a temporal
+        # question on a declarative-only corpus shouldn't be throttled to the
+        # declarative cap and waste budget.
+        if budget_left and len(results) < limit:
+            for memory_id, score in ranked:
+                if len(results) >= limit:
+                    break
+                if score < min_score or memory_id in chosen:
+                    continue
+                entry = self.memories.get(memory_id)
+                if not entry or entry.superseded_by:
+                    continue
+                if not _emit(entry, score):
+                    break
 
         return results
 
@@ -869,11 +1144,424 @@ class MemorySystem:
             conn.commit()
         return {"ok": True}
 
+    # ── Promotion management ──────────────────────────────────────────────────
+
+    def _dec(self, s: str) -> str:
+        enc = self.encryptor
+        if enc and getattr(enc, "config", None) and enc.config.enabled:
+            try:
+                return enc.decrypt_str(s)
+            except Exception:
+                return s
+        return s
+
+    def _mem_preview(self, memory_id: str, n: int = 120) -> Optional[dict]:
+        e = self.memories.get(memory_id)
+        if not e:
+            return None
+        content = e.content
+        return {
+            "id": e.id,
+            "preview": content[:n] + ("…" if len(content) > n else ""),
+            "project_id": e.project_id,
+            "universe": e.universe,
+        }
+
+    async def list_promotion_candidates(self, status: str = "pending") -> list:
+        """Pending (or other status) promotion candidates, with content previews."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM promotion_candidates WHERE status=? ORDER BY best_cosine DESC, id DESC",
+            (status,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            mem = self.memories.get(r["memory_id"])
+            if not mem:
+                continue
+            match_ids = json.loads(r["match_ids"])
+            out.append({
+                "candidate_id": r["id"],
+                "memory_id": r["memory_id"],
+                "content": mem.content,
+                "universe": mem.universe,
+                "project_id": mem.project_id,
+                "best_cosine": round(r["best_cosine"], 4),
+                "projects": json.loads(r["projects"]),
+                "matches": [m for m in (self._mem_preview(mid) for mid in match_ids) if m],
+                "timestamp": r["timestamp"],
+            })
+        return out
+
+    async def approve_promotion(self, candidate_id: int) -> dict:
+        """Approve a queued candidate: promote its memory to the general pool."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT * FROM promotion_candidates WHERE id=?", (candidate_id,)
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": "candidate_not_found"}
+        if row["status"] != "pending":
+            return {"ok": False, "error": f"candidate_{row['status']}"}
+        entry = self.memories.get(row["memory_id"])
+        if not entry:
+            async with self._get_lock():
+                conn.execute("UPDATE promotion_candidates SET status='dismissed' WHERE id=?",
+                             (candidate_id,))
+                conn.commit()
+            return {"ok": False, "error": "memory_gone"}
+        original_project = entry.project_id
+        entry.project_id = None
+        async with self._get_lock():
+            conn.execute("UPDATE memories SET project_id=NULL WHERE id=?", (entry.id,))
+            conn.execute("UPDATE promotion_candidates SET status='approved' WHERE id=?",
+                         (candidate_id,))
+            conn.execute("""
+                INSERT INTO promotions
+                    (memory_id, original_project, projects, match_ids,
+                     best_cosine, timestamp, trigger, reverted)
+                VALUES (?, ?, ?, ?, ?, ?, 'approved', 0)
+            """, (entry.id, original_project, row["projects"], row["match_ids"],
+                  row["best_cosine"], time.time()))
+            conn.commit()
+        return {"ok": True, "memory_id": entry.id}
+
+    async def dismiss_promotion(self, candidate_id: int) -> dict:
+        """Dismiss a queued candidate without promoting."""
+        conn = self._get_conn()
+        async with self._get_lock():
+            cur = conn.execute(
+                "UPDATE promotion_candidates SET status='dismissed' WHERE id=? AND status='pending'",
+                (candidate_id,),
+            )
+            conn.commit()
+        if cur.rowcount == 0:
+            return {"ok": False, "error": "candidate_not_found_or_not_pending"}
+        return {"ok": True}
+
+    async def list_promotions(self, include_reverted: bool = False) -> list:
+        """The promotion audit log (auto + approved), newest first."""
+        conn = self._get_conn()
+        sql = "SELECT * FROM promotions"
+        if not include_reverted:
+            sql += " WHERE reverted=0"
+        sql += " ORDER BY id DESC"
+        out = []
+        for r in conn.execute(sql).fetchall():
+            mem = self.memories.get(r["memory_id"])
+            out.append({
+                "promotion_id": r["id"],
+                "memory_id": r["memory_id"],
+                "content": mem.content if mem else "(deleted)",
+                "original_project": r["original_project"],
+                "projects": json.loads(r["projects"]),
+                "best_cosine": round(r["best_cosine"], 4),
+                "trigger": r["trigger"],
+                "timestamp": r["timestamp"],
+                "reverted": bool(r["reverted"]),
+            })
+        return out
+
+    def export_graph(self) -> dict:
+        """
+        Export the full memory graph for the visualizer: nodes (memories),
+        links (semantic lanes), and cluster metadata. Content is already
+        decrypted in memory, so no key access is needed here.
+        """
+        conn = self._get_conn()
+        cluster_theme = {cid: c.theme for cid, c in self.clusters.items()}
+        nodes = []
+        for e in self.memories.values():
+            nodes.append({
+                "id": e.id,
+                "content": e.content,
+                "universe": e.universe,
+                "project_id": e.project_id,
+                "is_general": e.project_id is None,
+                "cluster_id": e.cluster_id,
+                "cluster_theme": cluster_theme.get(e.cluster_id, "Unclustered"),
+                "priority": e.priority,
+                "access_count": e.access_count,
+                "tags": e.tags,
+                "category": e.category,
+                "event_time": e.event_time,
+                "superseded": e.superseded_by is not None,
+            })
+        links = []
+        try:
+            for r in conn.execute(
+                "SELECT source_id, target_id, weight, link_type FROM memory_links"
+            ):
+                if r["source_id"] in self.memories and r["target_id"] in self.memories:
+                    links.append({
+                        "source": r["source_id"],
+                        "target": r["target_id"],
+                        "weight": round(r["weight"], 3),
+                        "type": r["link_type"],
+                    })
+        except Exception:
+            pass
+        clusters = [
+            {"id": c.id, "theme": c.theme, "size": len(c.memory_refs),
+             "priority": c.priority}
+            for c in self.clusters.values()
+        ]
+        return {
+            "nodes": nodes,
+            "links": links,
+            "clusters": clusters,
+            "stats": {
+                "memories": len(self.memories),
+                "general": sum(1 for e in self.memories.values() if e.project_id is None),
+                "clusters": len(self.clusters),
+                "links": len(links),
+            },
+        }
+
+    async def revert_promotion(self, promotion_id: int) -> dict:
+        """Undo a promotion: return the memory to its original project scope."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT * FROM promotions WHERE id=?", (promotion_id,)
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": "promotion_not_found"}
+        if row["reverted"]:
+            return {"ok": False, "error": "already_reverted"}
+        entry = self.memories.get(row["memory_id"])
+        if entry:
+            entry.project_id = row["original_project"]
+        async with self._get_lock():
+            conn.execute("UPDATE memories SET project_id=? WHERE id=?",
+                         (row["original_project"], row["memory_id"]))
+            conn.execute("UPDATE promotions SET reverted=1 WHERE id=?", (promotion_id,))
+            conn.commit()
+        return {"ok": True, "restored_project": row["original_project"]}
+
+    # ── Compression / summarization (context economy) ────────────────────────
+
+    async def list_compression_candidates(
+        self,
+        project_id: Optional[str] = None,
+        min_chars: int = 600,
+        limit: int = 20,
+    ) -> list:
+        """
+        Verbose memories worth compressing — long, low/medium priority, not
+        superseded. Claude reads these and rewrites them tighter via
+        correct_memory, keeping the DB context-efficient as it grows. (Ported
+        concept from 3am-AI's introspection summarizer, adapted so Claude — not a
+        local LLM — does the summarizing.)
+        """
+        cands = []
+        for e in self.memories.values():
+            if e.superseded_by or e.universe == "episodic":
+                continue
+            if project_id is not None and e.project_id not in (project_id, None):
+                continue
+            if len(e.content) < min_chars:
+                continue
+            cands.append({
+                "id": e.id,
+                "chars": len(e.content),
+                "content": e.content,
+                "universe": e.universe,
+                "priority": e.priority,
+                "project_id": e.project_id,
+            })
+        cands.sort(key=lambda c: -c["chars"])
+        return cands[:limit]
+
+    async def summarize_cluster(self, cluster_id: str, http_client=None) -> dict:
+        """
+        Optional autonomous compression: if an llm_url is configured, ask it to
+        write a tight summary memory for a cluster. Without an LLM this is a
+        no-op (call list_compression_candidates and let Claude do it instead).
+        """
+        if not self.llm_url or http_client is None:
+            return {"ok": False, "error": "no_llm_url"}
+        cluster = self.clusters.get(cluster_id)
+        if not cluster:
+            return {"ok": False, "error": "cluster_not_found"}
+        members = [self.memories[m] for m in cluster.memory_refs
+                   if m in self.memories and not self.memories[m].superseded_by]
+        if len(members) < 3:
+            return {"ok": False, "error": "too_small"}
+        joined = "\n".join(f"- {m.content}" for m in members[:30])
+        prompt = ("Summarize these related memories into 1-3 concise factual "
+                  "sentences, preserving specifics:\n\n" + joined)
+        try:
+            resp = await http_client.post(
+                self.llm_url, json={"prompt": prompt, "max_tokens": 200}, timeout=30.0)
+            summary = resp.json().get("content", "").strip()
+        except Exception as e:
+            return {"ok": False, "error": f"llm_error: {e}"}
+        if not summary:
+            return {"ok": False, "error": "empty_summary"}
+        res = await self.store_memory(
+            content=summary, project_id=members[0].project_id,
+            universe="declarative", priority=4, category="general",
+            tags=["summary", f"cluster:{cluster_id}"])
+        return {"ok": True, "summary_memory_id": res["id"], "summarized": len(members)}
+
+    # ── Supersession / corrections (temporal: facts that change) ──────────────
+
+    async def mark_superseded(self, old_id: str, new_id: str) -> bool:
+        """Flag an existing memory as replaced by a newer one. It is not deleted
+        — it fades fast (10× decay) and is filtered from retrieval, preserving an
+        audit trail."""
+        entry = self.memories.get(old_id)
+        if not entry:
+            return False
+        entry.superseded_by = new_id
+        async with self._get_lock():
+            conn = self._get_conn()
+            conn.execute("UPDATE memories SET superseded_by=? WHERE id=?", (new_id, old_id))
+            conn.commit()
+        return True
+
+    async def supersede_memory(
+        self,
+        old_memory_id: str,
+        new_content: str,
+        priority: Optional[int] = None,
+        event_time: Optional[float] = None,
+    ) -> dict:
+        """
+        Record that a fact CHANGED: store new_content as a fresh memory (inheriting
+        the old one's scope/universe/category) and mark the old one superseded.
+        Use when a previously-true fact is now different ("we migrated X→Y").
+        Differs from correct_memory, which overwrites in place for a simple fix.
+        """
+        old = self.memories.get(old_memory_id)
+        if not old:
+            return {"ok": False, "error": "memory_not_found"}
+        res = await self.store_memory(
+            content=new_content,
+            project_id=old.project_id,
+            universe=old.universe,
+            priority=priority if priority is not None else max(old.priority, 4),
+            tags=old.tags,
+            session_id=old.session_id,
+            event_time=event_time,
+            category=old.category,
+            skip_dedup=True,
+        )
+        new_id = res["id"]
+        if new_id != old_memory_id:
+            await self.mark_superseded(old_memory_id, new_id)
+        return {"ok": True, "new_memory_id": new_id, "superseded": old_memory_id}
+
+    async def apply_correction(
+        self,
+        wrong_claim: str,
+        correct_fact: str,
+        project_id: Optional[str],
+    ) -> dict:
+        """
+        Apply an explicit user correction. Find the stored memory closest to
+        `wrong_claim` (within the project's visibility) and supersede it with a
+        high-priority memory of `correct_fact`. If no close match, just store the
+        correct fact.
+        """
+        wrong_claim = (wrong_claim or "").strip()
+        correct_fact = (correct_fact or "").strip()
+        if not correct_fact:
+            return {"ok": False, "error": "empty_correct_fact"}
+
+        matched_id = None
+        if wrong_claim:
+            emb = await self.embedder.embed(wrong_claim)
+            emb_bytes = np.array(emb, dtype=np.float32).tobytes()
+            conn = self._get_conn()
+            rows = conn.execute("""
+                SELECT memory_id, distance FROM vec_memories
+                WHERE embedding MATCH ? ORDER BY distance LIMIT 5
+            """, (emb_bytes,)).fetchall()
+            for r in rows:
+                mid = r["memory_id"]
+                if (mid in self.memories and self._is_visible(mid, project_id)
+                        and not self.memories[mid].superseded_by
+                        and (1.0 - r["distance"]) >= CORRECTION_MATCH_COSINE):
+                    matched_id = mid
+                    break
+
+        if matched_id:
+            old = self.memories[matched_id]
+            res = await self.store_memory(
+                content=correct_fact, project_id=project_id,
+                universe=old.universe, priority=max(old.priority, 4),
+                tags=old.tags, category=old.category, skip_dedup=True,
+            )
+            new_id = res["id"]
+            if new_id != matched_id:
+                await self.mark_superseded(matched_id, new_id)
+            return {"ok": True, "corrected": True, "superseded": matched_id,
+                    "new_memory_id": new_id}
+
+        res = await self.store_memory(
+            content=correct_fact, project_id=project_id,
+            universe="declarative", priority=4,
+        )
+        return {"ok": True, "corrected": False, "new_memory_id": res["id"]}
+
+    async def detect_conflicts(self, project_id: Optional[str] = None) -> dict:
+        """
+        Automatic conflict pass (ported from 3am-AI): within a scope, find pairs
+        of same-category memories that are close-but-not-duplicate (distance in
+        the conflict band) and keep the NEWER by timestamp, soft-superseding the
+        older. Runs as part of the maintenance/clustering pass.
+        """
+        conn = self._get_conn()
+        superseded = 0
+        seen: set = set()
+        for entry_id, entry in list(self.memories.items()):
+            if entry.superseded_by or entry_id in seen:
+                continue
+            emb_row = conn.execute(
+                "SELECT embedding FROM vec_memories WHERE memory_id=?", (entry_id,)
+            ).fetchone()
+            if not emb_row or not emb_row[0]:
+                continue
+            neighbors = conn.execute("""
+                SELECT memory_id, distance FROM vec_memories
+                WHERE embedding MATCH ? ORDER BY distance LIMIT ?
+            """, (emb_row[0], CONFLICT_SCAN_LIMIT)).fetchall()
+            for nb in neighbors:
+                nid, dist = nb["memory_id"], nb["distance"]
+                if nid == entry_id or nid in seen:
+                    continue
+                if dist < CONFLICT_DIST_NEAR:
+                    continue          # duplicate — handled by dedup
+                if dist > CONFLICT_DIST_FAR:
+                    break             # ordered by distance — past conflict band
+                other = self.memories.get(nid)
+                if (not other or other.superseded_by
+                        or other.category != entry.category
+                        or other.project_id != entry.project_id):
+                    continue
+                if project_id is not None and entry.project_id != project_id:
+                    continue
+                older = entry if entry.timestamp <= other.timestamp else other
+                newer = other if older is entry else entry
+                await self.mark_superseded(older.id, newer.id)
+                seen.add(older.id)
+                superseded += 1
+                if older.id == entry_id:
+                    break
+        return {"superseded": superseded}
+
     async def wipe_session_episodic(self, session_id: str) -> dict:
-        """Wipe all episodic memories tagged with this session_id."""
+        """Wipe all episodic memories tagged with this session_id, plus orphaned
+        episodics (session_id=None) older than 1 day that will never be cleaned up."""
+        import time
+        cutoff = time.time() - 86400  # 1 day ago
         to_delete = [
             mid for mid, e in self.memories.items()
-            if e.session_id == session_id and e.universe == "episodic"
+            if e.universe == "episodic" and (
+                e.session_id == session_id
+                or (e.session_id is None and e.timestamp < cutoff)
+            )
         ]
         async with self._get_lock():
             conn = self._get_conn()
@@ -1167,6 +1855,15 @@ class MemorySystem:
         self.stats["active_clusters"] = len(self.clusters)
         self.stats["last_clustering"] = current_time
 
+        # Maintenance: auto-resolve contradictions (keep newer same-category fact).
+        if self.conflict_detection:
+            try:
+                conflict = await self.detect_conflicts()
+                if conflict.get("superseded"):
+                    print(f"[Clustering] Conflict resolution: superseded {conflict['superseded']} stale memories")
+            except Exception as e:
+                print(f"[Clustering] Conflict detection error: {e}")
+
         print(f"[Clustering] Done: {len(raw)} clusters from {n} memories")
         return {"status": "success", "clusters": len(new_clusters), "memories": n}
 
@@ -1356,7 +2053,7 @@ class MemorySystem:
 
     # Bump the version string to re-seed on next server start (e.g. when adding
     # new seeds or correcting existing ones).
-    _SEEDS_VERSION = "v1"
+    _SEEDS_VERSION = "v2"
     _SEEDS: list[dict] = [
         {
             "content": (
@@ -1367,11 +2064,42 @@ class MemorySystem:
                 "— what's done, what still needs doing. Episodic memories decay in 1 day "
                 "and get wiped at session end, so use them freely. They're most valuable "
                 "when context gets compacted mid-session — get_session_summary will still "
-                "surface 'what's in flight' even after compression."
+                "surface 'what's in flight' even after compression. The PreCompact hook "
+                "blocks once right before compaction to give you a final checkpoint — "
+                "treat that prompt as the cue to flush anything not yet stored."
             ),
             "universe": "procedural",
             "priority": 5,
             "tags": ["episodic", "memory", "workflow", "behavior"],
+        },
+        {
+            "content": (
+                "Build a personal skill/approach playbook. When a Claude Code Skill "
+                "(e.g. /openscad, /code-review, /verify) or a specific non-obvious "
+                "approach works well — or notably fails — for a recurring kind of task, "
+                "store a procedural memory: which skill or approach, for what task type, "
+                "and the outcome. Example: 'For 3D-printable parametric parts, the "
+                "openscad skill is the right tool — invoke it rather than hand-writing "
+                "SCAD.' This lets future sessions pick the right tool immediately instead "
+                "of re-discovering it. Query for these before tackling a task that smells "
+                "familiar."
+            ),
+            "universe": "procedural",
+            "priority": 5,
+            "tags": ["skills", "tools", "workflow", "behavior", "playbook"],
+        },
+        {
+            "content": (
+                "Store user preferences and working style as general memories "
+                "(project_id=None) so they apply everywhere: how the user likes work "
+                "presented, tools/libraries they favor or avoid, conventions they've "
+                "corrected you on, and recurring constraints. These are high-priority "
+                "(4-5) and rarely decay. Query them before answering questions about the "
+                "user or making a stylistic choice — don't guess at what's already known."
+            ),
+            "universe": "procedural",
+            "priority": 5,
+            "tags": ["preferences", "user", "workflow", "behavior"],
         },
     ]
 

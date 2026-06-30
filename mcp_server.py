@@ -45,7 +45,7 @@ _SECRET_PATTERNS = [
         r'(?i)(api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token'
         r'|password|passwd|private[_-]?key)\s*[=:]\s*\S{8,}'
     ),
-    re.compile(r'\bsk-[A-Za-z0-9]{20,}\b'),                  # OpenAI / Anthropic keys
+    re.compile(r'\bsk-(?:ant-|proj-|svcacct-)?[A-Za-z0-9_-]{32,}\b'),  # OpenAI / Anthropic keys
     re.compile(r'\bghp_[A-Za-z0-9]{36,}\b'),                 # GitHub PATs
     re.compile(r'\bglpat-[A-Za-z0-9_-]{20,}\b'),             # GitLab PATs
     re.compile(r'-----BEGIN [A-Z ]+PRIVATE KEY-----'),        # PEM private keys
@@ -67,6 +67,38 @@ def _secrets_warning(content: str) -> Optional[str]:
 
 
 # ── Config + encryption ───────────────────────────────────────────────────────
+
+class _FernetEncryptor:
+    """
+    Minimal Fernet encryptor — a vendored fallback for data_security.DataEncryptor
+    (from threeam-core) so encryption at rest still works when that package isn't
+    installed. Matches the subset of the interface MemorySystem uses:
+    `.config.enabled`, `.encrypt_str`, `.decrypt_str`.
+    """
+
+    class _Config:
+        def __init__(self, enabled: bool):
+            self.enabled = enabled
+
+    def __init__(self, user_key: Optional[bytes]):
+        from cryptography.fernet import Fernet
+        self._fernet = Fernet(user_key) if user_key else None
+        self.config = self._Config(enabled=user_key is not None)
+
+    def encrypt_str(self, s: str) -> str:
+        return self._fernet.encrypt(s.encode()).decode() if self._fernet else s
+
+    def decrypt_str(self, s: str) -> str:
+        if not self._fernet:
+            return s
+        from cryptography.fernet import InvalidToken
+        try:
+            return self._fernet.decrypt(s.encode()).decode()
+        except (InvalidToken, Exception):
+            # Legacy plaintext written before encryption was enabled — return as-is.
+            return s
+
+
 
 def _load_config() -> dict:
     """Load config from the first found config file."""
@@ -97,7 +129,13 @@ def _get_encryptor():
     try:
         import keyring
         from cryptography.fernet import Fernet
-        from data_security import DataEncryptor
+
+        # Prefer the full DataEncryptor from threeam-core; fall back to the vendored
+        # _FernetEncryptor so encryption still works without that package installed.
+        try:
+            from data_security import DataEncryptor
+        except ImportError:
+            DataEncryptor = _FernetEncryptor
 
         service = "3am-claude"
         username = "enc-key"
@@ -190,6 +228,8 @@ async def store_memory(
     tags: Optional[list] = None,
     ttl_days: Optional[int] = None,
     session_id: Optional[str] = None,
+    event_time: Optional[float] = None,
+    category: str = "general",
 ) -> dict:
     """
     Store a memory in the persistent knowledge base.
@@ -203,10 +243,17 @@ async def store_memory(
                   general/cross-project memories (code style, preferences, datasheets)
       ttl_days: None=permanent, 7=code snippets that will become stale
       session_id: current session ID — tag episodic memories so wipe_episodic can clean up
+      event_time: epoch seconds the fact is ABOUT (e.g. when an event happened),
+                  for time-grounded recall ("when did X"). None → uses store time.
+      category: identity|preferences|relationship|projects|activities|general|skill —
+                drives category-aware decay (identity/preferences resist decay; a
+                project or activity is time-bound and fades normally).
 
     Memory hygiene: when you complete work that was previously stored as "planned",
     "todo", or "not yet implemented", use correct_memory or delete_memory to update
     those entries in the same turn — do not leave stale planned-feature memories in the DB.
+    When a previously-true fact has CHANGED (not just a typo fix), use supersede_memory
+    so the old value fades but stays auditable.
 
     Security: Do NOT store raw secrets, API keys, passwords, or PII.
     Store only reasoning and conclusions (e.g. "project uses bearer auth, token in .env").
@@ -226,10 +273,78 @@ async def store_memory(
         tags=tags or [],
         ttl_days=ttl_days,
         session_id=session_id,
+        event_time=event_time,
+        category=category,
     )
     if "id" in result:
         _schedule_cluster()
     return result
+
+
+@mcp.tool()
+async def supersede_memory(
+    old_memory_id: str,
+    new_content: str,
+    priority: Optional[int] = None,
+    event_time: Optional[float] = None,
+) -> dict:
+    """
+    Record that a fact CHANGED over time. Stores new_content as a fresh memory
+    (inheriting the old one's project/universe/category) and marks the old one
+    superseded — it fades fast (10× decay) and drops out of retrieval but stays
+    in the DB for audit. Use for "we migrated from X to Y", "renamed A to B",
+    "moved from Saskatoon to Regina". For a simple correction of a wrong value
+    in place, use correct_memory instead.
+
+    Returns {ok, new_memory_id, superseded} or {ok: false, error}
+    """
+    if not new_content or not new_content.strip():
+        return {"error": "new_content cannot be empty"}
+    warning = _secrets_warning(new_content)
+    if warning:
+        return {"error": warning}
+    result = await _memory.supersede_memory(
+        old_memory_id, new_content.strip(), priority=priority, event_time=event_time)
+    if result.get("ok"):
+        _schedule_cluster()
+    return result
+
+
+@mcp.tool()
+async def apply_correction(
+    wrong_claim: str,
+    correct_fact: str,
+    project_id: Optional[str],
+) -> dict:
+    """
+    Apply an explicit user correction. Finds the stored memory closest to
+    wrong_claim (within this project's visibility) and supersedes it with a
+    high-priority memory of correct_fact. If no close match exists, just stores
+    correct_fact. Use when the user says something previously stored was wrong
+    (e.g. "no, it's 3,000 acres not 2,000").
+
+    Returns {ok, corrected, superseded?, new_memory_id}
+    """
+    if not correct_fact or not correct_fact.strip():
+        return {"error": "correct_fact cannot be empty"}
+    warning = _secrets_warning(correct_fact)
+    if warning:
+        return {"error": warning}
+    result = await _memory.apply_correction(
+        wrong_claim or "", correct_fact.strip(), project_id or None)
+    if result.get("ok"):
+        _schedule_cluster()
+    return result
+
+
+@mcp.tool()
+async def list_compression_candidates(project_id: Optional[str] = None) -> list:
+    """
+    List verbose memories worth compressing (long, non-episodic, not superseded).
+    Read each and rewrite it tighter via correct_memory to keep recall context
+    efficient as the DB grows. Returns [{id, chars, content, universe, priority}].
+    """
+    return await _memory.list_compression_candidates(project_id or None)
 
 
 @mcp.tool()
@@ -253,7 +368,11 @@ async def query_memory(
       min_score:  minimum PPR score to include — results below this are dropped even
                   if under the limit. Use ~0.01-0.03 to cut low-signal padding.
 
-    Each result: {id, content, universe, score, cluster_theme, project_id, tags, priority}
+    Temporal questions ("when did X", "before/after") automatically widen the
+    retrieval beam. Superseded (replaced/corrected) memories are excluded.
+
+    Each result: {id, content, universe, score, cluster_theme, project_id, tags,
+                  priority, category, event_time, timestamp}
     """
     if not query or not query.strip():
         return []
@@ -292,6 +411,77 @@ async def promote_to_general(memory_id: str) -> dict:
     Returns {ok: true} or {ok: false, error: "..."}
     """
     return await _memory.promote_to_general(memory_id)
+
+
+@mcp.tool()
+async def list_promotion_candidates() -> list:
+    """
+    List pending auto-promotion candidates: project memories that closely match
+    knowledge in OTHER projects but weren't auto-promoted (borderline similarity).
+
+    Each candidate shows the memory, its best cross-project cosine, the projects
+    the concept spans, and previews of the matching memories. Review these and
+    call approve_promotion (move to the general pool) or dismiss_promotion.
+
+    Returns [{candidate_id, memory_id, content, best_cosine, projects, matches}]
+    """
+    return await _memory.list_promotion_candidates()
+
+
+@mcp.tool()
+async def approve_promotion(candidate_id: int) -> dict:
+    """
+    Approve a queued promotion candidate — moves its memory to the general pool
+    (project_id=NULL) so it's visible across all projects. Logged and reversible.
+
+    Returns {ok: true, memory_id} or {ok: false, error: "..."}
+    """
+    return await _memory.approve_promotion(candidate_id)
+
+
+@mcp.tool()
+async def dismiss_promotion(candidate_id: int) -> dict:
+    """
+    Dismiss a queued promotion candidate without promoting it. Use when the match
+    is coincidental and the memory should stay project-scoped.
+
+    Returns {ok: true} or {ok: false, error: "..."}
+    """
+    return await _memory.dismiss_promotion(candidate_id)
+
+
+@mcp.tool()
+async def list_promotions() -> list:
+    """
+    The promotion audit log: memories that have been moved to the general pool
+    automatically or by approval. Use to review or find a promotion to revert.
+
+    Returns [{promotion_id, memory_id, content, original_project, projects,
+              best_cosine, trigger, timestamp, reverted}]
+    """
+    return await _memory.list_promotions()
+
+
+@mcp.tool()
+async def revert_promotion(promotion_id: int) -> dict:
+    """
+    Undo a promotion — returns the memory to its original project scope. Use when
+    a memory was promoted to general but turns out to be project-specific.
+
+    Returns {ok: true, restored_project} or {ok: false, error: "..."}
+    """
+    return await _memory.revert_promotion(promotion_id)
+
+
+@mcp.tool()
+async def resolve_conflicts(project_id: Optional[str] = None) -> dict:
+    """
+    Manually run the contradiction pass: same-category memories that are
+    close-but-not-duplicate get resolved by keeping the NEWER (by timestamp) and
+    soft-superseding the older. Runs automatically during clustering; call this to
+    force it now. Returns {superseded: N}.
+    """
+    return await _memory.detect_conflicts(project_id or None)
 
 
 @mcp.tool()
@@ -513,7 +703,7 @@ class _PromptContextApp:
             project_id=project_id,
             limit=limit,
             max_tokens=800,
-            min_score=0.02,
+            min_score=0.06,
         )
 
         if not memories:
@@ -533,7 +723,7 @@ class _SessionStopApp:
     """
     Minimal ASGI handler for POST /api/session-stop
 
-    Called by the StopSession hook at session end.
+    Called by the SessionEnd hook at session end.
     Triggers a full recluster to incorporate memories stored this session,
     then wipes episodic memories for the ended session.
 
@@ -557,13 +747,71 @@ class _SessionStopApp:
 
         # Recluster first — incorporates memories stored this session
         _schedule_cluster()
-        print(f"[3am-claude] StopSession: clustering scheduled for {session_id}")
+        print(f"[3am-claude] SessionEnd: clustering scheduled for {session_id}")
 
         result = await _memory.wipe_session_episodic(session_id)
         wiped = result.get("wiped", 0)
         if wiped > 0:
-            print(f"[3am-claude] StopSession: wiped {wiped} episodic memories for {session_id}")
+            print(f"[3am-claude] SessionEnd: wiped {wiped} episodic memories for {session_id}")
         resp = JSONResponse(result)
+        await resp(scope, receive, send)
+
+
+_STATIC_DIR = Path(__file__).parent / "static"
+
+
+class _UIApp:
+    """
+    Serves the memory visualizer (GET /ui) and its JSON API (/api/ui/*):
+
+      GET  /ui                         → the visualizer page
+      GET  /api/ui/graph               → nodes + links + clusters + stats
+      GET  /api/ui/candidates          → pending promotion candidates
+      GET  /api/ui/promotions          → promotion audit log
+      POST /api/ui/candidates/approve?id=N
+      POST /api/ui/candidates/dismiss?id=N
+      POST /api/ui/promotions/revert?id=N
+    """
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        method = scope.get("method", "GET")
+
+        if path == "/ui" or path == "/ui/":
+            index = _STATIC_DIR / "index.html"
+            if not index.exists():
+                resp = JSONResponse({"error": "UI not installed"}, status_code=404)
+            else:
+                from starlette.responses import HTMLResponse
+                resp = HTMLResponse(index.read_text(encoding="utf-8"))
+            await resp(scope, receive, send)
+            return
+
+        if _memory is None:
+            resp = JSONResponse({"error": "memory not ready"}, status_code=503)
+            await resp(scope, receive, send)
+            return
+
+        request = Request(scope, receive)
+
+        if path == "/api/ui/graph":
+            resp = JSONResponse(_memory.export_graph())
+        elif path == "/api/ui/candidates":
+            resp = JSONResponse({"candidates": await _memory.list_promotion_candidates()})
+        elif path == "/api/ui/promotions":
+            resp = JSONResponse({"promotions": await _memory.list_promotions()})
+        elif path == "/api/ui/candidates/approve" and method == "POST":
+            cid = int(request.query_params.get("id", 0))
+            resp = JSONResponse(await _memory.approve_promotion(cid))
+        elif path == "/api/ui/candidates/dismiss" and method == "POST":
+            cid = int(request.query_params.get("id", 0))
+            resp = JSONResponse(await _memory.dismiss_promotion(cid))
+        elif path == "/api/ui/promotions/revert" and method == "POST":
+            pid = int(request.query_params.get("id", 0))
+            resp = JSONResponse(await _memory.revert_promotion(pid))
+        else:
+            resp = JSONResponse({"error": "not found"}, status_code=404)
+
         await resp(scope, receive, send)
 
 
@@ -578,16 +826,34 @@ class _CompositeApp:
         self._session_ctx = _SessionContextApp()
         self._prompt_ctx = _PromptContextApp()
         self._session_stop = _SessionStopApp()
+        self._ui = _UIApp()
 
     async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
         if scope["type"] == "lifespan":
             await self._handle_lifespan(receive, send)
-        elif scope["type"] == "http" and scope.get("path") == "/api/session-context":
+        elif scope["type"] == "http" and path == "/api/session-context":
             await self._session_ctx(scope, receive, send)
-        elif scope["type"] == "http" and scope.get("path") == "/api/prompt-context":
+        elif scope["type"] == "http" and path == "/api/prompt-context":
             await self._prompt_ctx(scope, receive, send)
-        elif scope["type"] == "http" and scope.get("path") == "/api/session-stop":
+        elif scope["type"] == "http" and path == "/api/session-stop":
             await self._session_stop(scope, receive, send)
+        elif scope["type"] == "http" and (path == "/ui" or path == "/ui/" or path.startswith("/api/ui/")):
+            await self._ui(scope, receive, send)
+        elif scope["type"] == "http" and scope.get("path") == "/health":
+            ready = _memory is not None
+            resp = JSONResponse(
+                {
+                    "status": "ok" if ready else "starting",
+                    "memories": len(_memory.memories) if ready else 0,
+                    "clusters": len(_memory.clusters) if ready else 0,
+                    "encrypted": bool(ready and _memory.encryptor
+                                      and getattr(_memory.encryptor, "config", None)
+                                      and _memory.encryptor.config.enabled),
+                },
+                status_code=200 if ready else 503,
+            )
+            await resp(scope, receive, send)
         else:
             await self._mcp(scope, receive, send)
 
