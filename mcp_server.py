@@ -711,9 +711,13 @@ class _PromptContextApp:
             await resp(scope, receive, send)
             return
 
-        lines = ["[3am] Relevant memories:"]
+        import datetime as _dt
+        now_str = _dt.datetime.now().strftime("%Y-%m-%d %H:%M %Z").strip()
+        lines = [f"[3am] Current time: {now_str}", "Relevant memories (with age):"]
         for m in memories:
-            lines.append(f"- [{m['universe']}] {m['content']}")
+            age = m.get("age")
+            age_tag = f" ({age})" if age else ""
+            lines.append(f"- [{m['universe']}{age_tag}] {m['content']}")
 
         resp = JSONResponse({"additionalContext": "\n".join(lines)})
         await resp(scope, receive, send)

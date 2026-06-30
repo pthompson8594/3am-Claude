@@ -110,6 +110,33 @@ def _is_temporal_query(query: str) -> bool:
         return True
     return any(m in q for m in _MONTHS)
 
+
+def _humanize_age(ts: Optional[float], now: float) -> Optional[str]:
+    """Server-computed relative age so the caller can reason about staleness
+    without doing epoch arithmetic. e.g. 'just now', '3d ago', '5mo ago'."""
+    if not ts:
+        return None
+    sec = now - ts
+    if sec < 0:
+        sec = abs(sec)
+        suffix = "from now"
+    else:
+        suffix = "ago"
+    if sec < 60:
+        return "just now" if suffix == "ago" else "imminent"
+    m = sec / 60
+    if m < 60:
+        return f"{int(m)}m {suffix}"
+    h = m / 60
+    if h < 24:
+        return f"{int(h)}h {suffix}"
+    d = h / 24
+    if d < 30:
+        return f"{int(d)}d {suffix}"
+    if d < 365:
+        return f"{int(d / 30)}mo {suffix}"
+    return f"{d / 365:.1f}y {suffix}"
+
 # Per-universe retrieval fractions by query type (episodic, declarative, procedural).
 # Applied as soft caps on the result set — keeps context balanced for the query intent.
 CONTEXT_BIAS = {
@@ -1057,6 +1084,8 @@ class MemorySystem:
                 "category": entry.category,
                 "event_time": entry.event_time,
                 "timestamp": entry.timestamp,
+                "age": _humanize_age(entry.timestamp, now),
+                "event_age": _humanize_age(entry.event_time, now),
             })
             return True
 
