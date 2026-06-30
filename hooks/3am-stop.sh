@@ -93,7 +93,12 @@ CORR = re.compile(
     r"\b(no|nope|actually|wrong|incorrect|that'?s not|that is not|don'?t|stop|"
     r"undo|revert|you (missed|forgot|broke|misunderstood)|not what|isn'?t right|"
     r"shouldn'?t|instead of)\b", re.IGNORECASE)
-correction = 1 if (last_text and CORR.search(last_text)) else 0
+# Only treat as a real correction when the message is SHORT and FEW-LINE. Long or
+# multi-line turns (pasted docs/output, or a slash-command skill's injected prompt
+# like /3am-consolidate) contain correction vocabulary without being corrections —
+# the keyword scan over those was the source of false 'you were corrected' fires.
+is_brief = last_text and len(last_text) < 240 and last_text.count("\n") < 3
+correction = 1 if (is_brief and CORR.search(last_text)) else 0
 print(f"{correction} {1 if did_work else 0}")
 PY
 )
