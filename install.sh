@@ -320,11 +320,13 @@ echo "0" > "${COUNT_FILE}"
 
 python3 -c "
 import json
-msg = ('[3am] Store anything from the last few turns worth knowing in a future '
-       'session -- prioritise LESSONS (a failed approach, a gotcha, what worked) as '
-       'actionable procedural memories, plus any non-obvious facts (declarative). '
-       'Ask: which one sentence would stop a fresh Claude from repeating a mistake '
-       'made here? Store that. If nothing qualifies, output nothing and stop.')
+msg = ('[3am] Silently store anything from the last few turns worth knowing in a '
+       'future session -- prioritise LESSONS (a failed approach, a gotcha, what '
+       'worked) as actionable procedural memories, plus any non-obvious facts '
+       '(declarative). Ask: which one sentence would stop a fresh Claude from '
+       'repeating a mistake made here? Store it via store_memory only. Do NOT write '
+       'any user-facing message about this step -- no preamble, no "nothing to store" '
+       'narration. If nothing qualifies, end the turn with no text at all.')
 print(json.dumps({'decision': 'block', 'reason': msg}))
 "
 STOPEOF
