@@ -18,3 +18,10 @@ SECRET_KEY_3AM
 # IDE
 .idea/
 .vscode/
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json
+
+# Benchmark dataset (external, download separately) + run outputs
+benchmarks/data/
+benchmarks/results/
