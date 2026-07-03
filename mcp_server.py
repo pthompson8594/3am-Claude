@@ -25,7 +25,10 @@ Architecture:
 
 import asyncio
 import json
+import os
 import re
+import sqlite3
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Optional
@@ -114,42 +117,105 @@ def _load_config() -> dict:
     return {}
 
 
-def _get_encryptor():
-    """
-    Load (or generate) the Fernet key from the system keyring.
-    Returns a DataEncryptor instance, or None if keyring is unavailable.
+def _db_has_encrypted_data(db_path: Path) -> bool:
+    """True if the memory DB already holds Fernet-encrypted content. Used to decide
+    whether losing the key is catastrophic (data exists) or harmless (first run)."""
+    try:
+        con = sqlite3.connect(str(db_path))
+        row = con.execute(
+            "SELECT 1 FROM memories WHERE content LIKE 'gAAAAA%' LIMIT 1"
+        ).fetchone()
+        con.close()
+        return row is not None
+    except Exception:
+        return False
 
-    Key storage: system keyring under service="3am-claude", username="enc-key".
-    First run: generates a random Fernet key and stores it.
-    Subsequent runs: retrieves the stored key.
 
-    Threat model: protects against filesystem access (malware, shared machine).
-    A valid Fernet blob cannot be forged without the key — poisoned injections fail.
+class KeyUnavailableError(RuntimeError):
+    """Raised when the encryption key can't be obtained but encrypted data exists.
+    We fail startup loudly (systemd Restart=on-failure retries) rather than run
+    unencrypted — which would hide the data as ciphertext AND write new plaintext."""
+
+
+def _get_encryptor(db_path: Path):
     """
+    Obtain the Fernet key. Order: SECRET_KEY_3AM env → system keyring (with retry
+    for the boot race where the daemon starts before the secret service).
+
+    Safety rules (learned the hard way — a boot-time keyring miss must never
+    destroy or orphan data):
+      • NEVER generate/overwrite a key when the DB already has encrypted memories.
+      • If the keyring is unreachable AND encrypted data exists → raise (fail
+        startup) instead of running unencrypted. systemd retries until the
+        secret service is up.
+      • Only generate a fresh key on a genuinely empty DB (true first run).
+
+    Key storage: system keyring, service="3am-claude", username="enc-key".
+    Threat model: protects against filesystem access; a valid Fernet blob can't be
+    forged without the key, so poisoned injections fail to decrypt.
+    """
+    from cryptography.fernet import Fernet
+    try:
+        from data_security import DataEncryptor
+    except ImportError:
+        DataEncryptor = _FernetEncryptor
+
+    # 1. Explicit env override — stable fallback for headless/CI or a flaky keyring.
+    env_key = os.environ.get("SECRET_KEY_3AM")
+    if env_key:
+        print("[3am-claude] Using SECRET_KEY_3AM from environment.")
+        return DataEncryptor(env_key.encode())
+
+    service, username = "3am-claude", "enc-key"
+    has_data = _db_has_encrypted_data(db_path)
+
+    # 2. Keyring, retrying a few times to ride out the boot race (secret service
+    #    may register on D-Bus a few seconds after the daemon starts).
+    stored, keyring_err = None, None
     try:
         import keyring
-        from cryptography.fernet import Fernet
-
-        # Prefer the full DataEncryptor from threeam-core; fall back to the vendored
-        # _FernetEncryptor so encryption still works without that package installed.
-        try:
-            from data_security import DataEncryptor
-        except ImportError:
-            DataEncryptor = _FernetEncryptor
-
-        service = "3am-claude"
-        username = "enc-key"
-        stored = keyring.get_password(service, username)
-        if stored:
-            key = stored.encode()
-        else:
-            key = Fernet.generate_key()
-            keyring.set_password(service, username, key.decode())
-            print("[3am-claude] Generated new encryption key in system keyring.")
-        return DataEncryptor(key)
+        for attempt in range(6):
+            try:
+                stored = keyring.get_password(service, username)
+                keyring_err = None
+                break
+            except Exception as e:
+                keyring_err = e
+                if attempt < 5:
+                    time.sleep(2)
     except Exception as e:
-        print(f"[3am-claude] Keyring unavailable ({e}). Running without encryption.")
+        keyring_err = e
+
+    if keyring_err is not None:
+        if has_data:
+            raise KeyUnavailableError(
+                f"Keyring unreachable ({keyring_err}) but encrypted memories exist. "
+                "Refusing to start unencrypted (would hide your data and write "
+                "plaintext). Ensure the secret service (kwallet/gnome-keyring) is "
+                "running, or set SECRET_KEY_3AM. Startup will be retried."
+            )
+        print(f"[3am-claude] Keyring unavailable ({keyring_err}) and no encrypted "
+              "data yet — running without encryption.")
         return None
+
+    if stored:
+        return DataEncryptor(stored.encode())
+
+    # Keyring reachable but no key stored.
+    if has_data:
+        raise KeyUnavailableError(
+            "Encryption key is missing from the keyring but encrypted memories "
+            "exist. Refusing to generate a new key (it would orphan your data). "
+            "Restore the key entry (service='3am-claude', user='enc-key') or set "
+            "SECRET_KEY_3AM."
+        )
+
+    # Genuine first run — empty DB. Safe to generate and store.
+    import keyring
+    key = Fernet.generate_key()
+    keyring.set_password(service, username, key.decode())
+    print("[3am-claude] Generated new encryption key in system keyring.")
+    return DataEncryptor(key)
 
 
 # ── Globals ───────────────────────────────────────────────────────────────────
@@ -962,10 +1028,10 @@ class _CompositeApp:
 
             # Our startup
             _config = _load_config()
-            encryptor = _get_encryptor()
             db_path = Path(
                 _config.get("db_path", "~/.local/share/3am-claude/memory.db")
             ).expanduser()
+            encryptor = _get_encryptor(db_path)
             _memory = MemorySystem(
                 db_path=db_path,
                 encryptor=encryptor,

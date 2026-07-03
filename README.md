@@ -256,11 +256,13 @@ journalctl --user -u 3am-claude -f
 
 **Port conflict** — change `server_port` in `config.json` and update the URL in `settings.json` and `3am-session-start.sh`.
 
-**Keyring unavailable** (headless/CI) — set `SECRET_KEY_3AM` as an environment variable; the server falls back to it if the keyring is inaccessible.
+**Keyring unavailable** (headless/CI) — set `SECRET_KEY_3AM` as an environment variable; the server uses it before touching the keyring.
+
+**Encrypted content shows as `gAAAAAB…` ciphertext / garbled cluster labels** — the daemon started before the secret service (kwallet/gnome-keyring) was up and ran without the key. It no longer *silently* does this: with encrypted data present it now retries the keyring and, if still unavailable, **fails startup** so systemd restarts it until the secret service is ready (`After=graphical-session.target`, `StartLimitIntervalSec=0`, `Restart=on-failure`). If you see it, just ensure the keyring is unlocked and `systemctl --user restart 3am-claude`; then `trigger_clustering` to refresh any themes computed while it was down. The key is not lost — the data decrypts once the daemon reattaches to it.
 
 **Stale cluster themes** — run `cli.py cluster` or call `trigger_clustering` from inside Claude Code.
 
-**Key loss** — if the keyring is wiped, use a `cli.py export` backup to recover memories on a new machine.
+**Key loss** — the daemon will **never generate a new key or run unencrypted when encrypted memories already exist** (it fails loudly instead), so a boot-time keyring hiccup can't orphan your data. Genuine key loss only happens if the keyring entry itself is wiped (`service=3am-claude`, `user=enc-key`); run `cli.py export` periodically as a backup, or set a stable `SECRET_KEY_3AM`.
 
 ---
 

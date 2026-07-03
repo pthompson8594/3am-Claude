@@ -67,7 +67,12 @@ if command -v systemctl &>/dev/null && systemctl --user status &>/dev/null 2>&1;
     cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=3am-claude MCP Memory Server
-After=network.target
+# Start after the graphical session so the secret service (kwallet/gnome-keyring)
+# is up before we need the encryption key. The daemon also retries the keyring
+# internally, and StartLimitIntervalSec=0 lets systemd retry indefinitely if the
+# key still isn't available at boot (rather than giving up after a few tries).
+After=network.target graphical-session.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
