@@ -275,17 +275,23 @@ for m in msgs[human_idx+1:]:
             did_work = True
             break
 
-CORR = re.compile(
-    r"\b(no|nope|actually|wrong|incorrect|that'?s not|that is not|don'?t|stop|"
-    r"undo|revert|you (missed|forgot|broke|misunderstood)|not what|isn'?t right|"
-    r"shouldn'?t|instead of)\b", re.IGNORECASE)
-# Only treat as a real correction when the message is SHORT and FEW-LINE. Long or
-# multi-line turns (pasted docs/output, or a slash-command skill's injected prompt
-# like /3am-consolidate) contain correction vocabulary without being corrections --
-# the keyword scan over those was the source of false 'you were corrected' fires.
-is_brief = last_text and len(last_text) < 240 and last_text.count("\n") < 3
-correction = 1 if (is_brief and CORR.search(last_text)) else 0
-print(f"{correction} {1 if did_work else 0}")
+# A correction is signalled by correction FRAMING, not the mere presence of a
+# common word: bare 'no'/'don't'/'not'/'stop' appear constantly in ordinary
+# sentences ('i don't see', 'no worries', 'not sure'), so keyword-presence
+# over-fires. Require EITHER a leading correction word (unambiguous ones, or the
+# soft ones only when followed by a comma) OR an explicit correction phrase.
+_lead_strong = re.compile(r"^\W*(actually|nope|wrong|incorrect|undo|revert)\b", re.IGNORECASE)
+_lead_soft   = re.compile(r"^\W*(no|nah|stop|wait)\b\s*,", re.IGNORECASE)
+_frame = re.compile(
+    r"\b(that'?s (not right|wrong|incorrect|not what)|not what i (meant|asked|wanted|said)|"
+    r"you (missed|forgot|broke|misunderstood|didn'?t)|isn'?t right|"
+    r"should(n'?t| not) have|do(n'?t| not) do that|instead of (that|doing))\b", re.IGNORECASE)
+# Long/multi-line turns (pasted docs, slash-command skill prompts) are never
+# corrections regardless of wording.
+is_brief = bool(last_text) and len(last_text) < 240 and last_text.count("\n") < 3
+is_corr = is_brief and (_lead_strong.match(last_text) or _lead_soft.match(last_text)
+                        or _frame.search(last_text))
+print(f"{1 if is_corr else 0} {1 if did_work else 0}")
 PY
 )
 
