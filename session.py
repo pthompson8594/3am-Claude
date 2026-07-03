@@ -40,15 +40,59 @@ def project_id_from_path(path: str) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
+# Files/dirs that mark a project root when there's no git repo. Lets non-git
+# folders get a stable project_id instead of collapsing into the general pool.
+# `.3am-project` is an explicit escape hatch: drop one to anchor a root by hand.
+_PROJECT_MARKERS = (
+    ".3am-project", ".git", "CLAUDE.md", "pyproject.toml", "package.json",
+    "Cargo.toml", "go.mod", "platformio.ini", "CMakeLists.txt", "Makefile",
+    ".hg", ".svn", "requirements.txt",
+)
+
+
+def find_project_root(cwd: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve the project root for `cwd`, git or not:
+      1. the git root (canonical, stable), else
+      2. the nearest ancestor containing a project marker (so a subdirectory
+         still maps to the project, not to itself), else
+      3. the working directory itself.
+    Returns None for non-project locations (home dir, filesystem root, /tmp) so
+    those fall through to the general pool.
+    """
+    start = Path(cwd or os.getcwd()).resolve()
+
+    git_root = get_git_root(str(start))
+    if git_root:
+        return git_root
+
+    home = Path.home().resolve()
+    non_projects = {home, Path("/"), Path("/tmp")}
+
+    for d in [start, *start.parents]:
+        if d in non_projects:
+            break
+        if any((d / m).exists() for m in _PROJECT_MARKERS):
+            return str(d)
+        if d == d.parent:  # filesystem root
+            break
+
+    if start in non_projects:
+        return None
+    return str(start)
+
+
 def get_project_id(cwd: Optional[str] = None) -> Optional[str]:
     """
-    Detect current project_id from git root.
-    Returns None if not in a git repo (memories stored as general/shared).
+    Stable project_id for the current location — works for non-git projects too
+    (falls back to a marker-detected root, then the directory itself). Returns
+    None only for non-project locations (home/root/tmp), which use the general
+    pool. Git projects keep the same id as before (git root wins).
     """
-    git_root = get_git_root(cwd)
-    if git_root:
-        return project_id_from_path(git_root)
-    return None
+    root = find_project_root(cwd)
+    if root is None:
+        return None
+    return project_id_from_path(root)
 
 
 def new_session_id() -> str:
