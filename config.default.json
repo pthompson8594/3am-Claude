@@ -29,6 +29,7 @@
   "promote_min_projects": 2,
 
   "conflict_detection": false,
+  "ingest_claude_md": false,
 
   "recall_min_cosine": 0.62
 }

@@ -687,8 +687,11 @@ class _SessionContextApp:
             await resp(scope, receive, send)
             return
 
-        # CLAUDE.md bootstrap — fires once per project
-        if project_root and project_id:
+        # CLAUDE.md bootstrap — off by default: CLAUDE.md is already injected into
+        # every session by the SessionStart hook, so ingesting it as searchable
+        # memories just duplicates always-present content and clutters recall.
+        # Enable with config "ingest_claude_md": true if you want it anyway.
+        if _config.get("ingest_claude_md", False) and project_root and project_id:
             try:
                 await _memory.maybe_ingest_claude_md(project_root, project_id)
             except Exception as e:
