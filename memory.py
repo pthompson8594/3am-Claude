@@ -313,7 +313,12 @@ class MemorySystem:
         self.promote_auto_cosine     = float(_cfg.get("promote_auto_cosine", PROMOTE_AUTO_COSINE))
         self.promote_candidate_cosine = float(_cfg.get("promote_candidate_cosine", PROMOTE_CANDIDATE_COSINE))
         self.promote_min_projects    = int(_cfg.get("promote_min_projects", PROMOTE_MIN_PROJECTS))
-        self.conflict_detection      = _cfg.get("conflict_detection", True)
+        # Auto conflict-detection is OFF by default: cosine similarity can't
+        # distinguish a real contradiction ("same fact, new value") from two
+        # distinct facts on the same topic, so it wrongly superseded ~1/3 of the
+        # store. Contradictions are handled explicitly via supersede_memory /
+        # apply_correction instead. Re-enable only with a much tighter guard.
+        self.conflict_detection      = _cfg.get("conflict_detection", False)
         self.recall_min_cosine       = float(_cfg.get("recall_min_cosine", 0.62))
 
         self.memories: dict[str, MemoryEntry] = {}

@@ -28,7 +28,7 @@
   "promote_candidate_cosine": 0.82,
   "promote_min_projects": 2,
 
-  "conflict_detection": true,
+  "conflict_detection": false,
 
   "recall_min_cosine": 0.62
 }
