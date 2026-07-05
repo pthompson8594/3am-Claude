@@ -37,7 +37,13 @@ Every auto-promotion is written to an audit log (`list_promotions`) and can be u
 
 Facts change. 3am-claude handles time along two axes:
 
-**Contradiction / supersession** (ported from the 3am-AI engine). When a fact is replaced — "we migrated from Flask to FastAPI", "moved from Saskatoon to Regina" — use `supersede_memory` (or `apply_correction` for an explicit user correction). The old memory isn't deleted: it's flagged `superseded_by`, **decays 10× faster**, and is **excluded from retrieval**, but stays in the DB for audit. A background **conflict-detection** pass (during clustering, or on-demand via `resolve_conflicts`) catches contradictions you didn't flag: same-category memories that are close-but-not-duplicate get resolved by keeping the newer one.
+**Contradiction / supersession** (ported from the 3am-AI engine). When a fact is replaced — "we migrated from Flask to FastAPI", "moved from Saskatoon to Regina" — use `supersede_memory` (or `apply_correction` for an explicit user correction). The old memory isn't deleted: it's flagged `superseded_by`, **decays 10× faster**, and is **excluded from retrieval**, but stays in the DB for audit.
+
+**Store-time conflict surfacing.** Cosine similarity can't tell "same fact, new value" from "two distinct facts on the same topic" — so the engine never auto-resolves contradictions (automatic conflict-detection is off by default; it wrongly retired distinct memories). Instead, when a newly stored memory lands semantically close to existing same-scope memories, `store_memory` returns them as `possible_conflicts` and *Claude* judges: same fact with an outdated value → `mark_superseded(old_id, new_id)`; distinct fact → leave it. Near-identical stores (above the dedup threshold) return the existing content with a `dedup_note` instead, so a value change is never silently swallowed by dedup.
+
+**Provenance.** Every memory can carry a `source`: `user-stated` (authoritative), `inferred` (could be wrong), `observed-in-code` (drifts as code changes), or `ingested`. It's surfaced in every recall — `[declarative, user-stated, 3d ago]` — so a future session knows how much to trust what it's reading.
+
+**Distrust flags.** When a recalled memory contradicts what Claude currently sees but the right value isn't known yet, `flag_memory(id, reason)` marks it suspect: demoted in query ranking, excluded from unprompted action-recall injection, queued in `list_flagged` for review. Resolve later with `unflag_memory`, `correct_memory`, `supersede_memory`, or `delete_memory`.
 
 **Time-grounded retrieval.** Memories carry an optional `event_time` (when the fact is *about*, vs. the store-time `timestamp`), and temporal questions ("when did X", "before/after") automatically widen the retrieval beam. Combined with soft per-universe caps (unused slots backfill instead of being wasted), this substantially lifts recall on time-oriented queries — see [benchmarks/README.md](benchmarks/README.md) for the before/after on LoCoMo.
 
@@ -136,13 +142,17 @@ systemctl --user status 3am-claude
 
 | Tool | Description |
 |------|-------------|
-| `store_memory` | Store a fact. Claude classifies universe and priority before calling. |
+| `store_memory` | Store a fact. Claude classifies universe, priority, and provenance (`source`); returns `possible_conflicts` for judgment when neighbors are suspiciously close. |
 | `query_memory` | Retrieve relevant memories for a query. Hybrid FTS5 + vector + PPR. |
 | `get_session_summary` | Cluster themes for the current project + general pool. Call at session start. |
 | `ingest_document` | Batch-store a list of propositions (Claude extracts them from docs). |
-| `correct_memory` | Replace memory content in-place, re-embeds, rebuilds lanes. |
+| `correct_memory` | Replace memory content in-place, re-embeds, rebuilds lanes (also clears any distrust flag). |
 | `supersede_memory` | Record that a fact *changed* — stores the new value, fades the old one (kept for audit). |
+| `mark_superseded` | Mark an existing memory as replaced by another already-stored one — the resolution path for `possible_conflicts`. |
 | `apply_correction` | Apply a user correction: find the memory matching the wrong claim and supersede it. |
+| `flag_memory` | Mark a memory as suspect (no correct value needed yet): demoted in ranking, excluded from action recall, queued for review. |
+| `unflag_memory` | Clear a distrust flag — the memory turned out to be fine. |
+| `list_flagged` | The distrust review queue, newest first. |
 | `resolve_conflicts` | Run the contradiction pass now (same-category, keep newer). Also runs during clustering. |
 | `list_compression_candidates` | List verbose memories worth rewriting tighter (context economy). |
 | `delete_memory` | Hard-delete a specific memory by ID. |
@@ -192,7 +202,9 @@ Fires right before context is compacted — the one moment session detail is act
 Fires when the session ends. Triggers a full recluster (incorporating memories stored this session) and wipes episodic memories for the session.
 
 **PreToolUse + PostToolUse** (`~/.claude/hooks/3am-recall.sh` → `hooks/recall_hook.py`)
-**Action-triggered recall.** Standard recall is *input*-triggered — memories are matched against your prompt. But mid-task Claude's reasoning drifts to subtopics the prompt never mentioned, and the relevant memory is missed. This hook makes recall follow what Claude is *doing*: before an Edit/Write and after a Read/Edit/Grep, it derives a signal from the activity (the code being changed, the file, the search pattern) and surfaces relevant memories — so a stored lesson appears exactly when Claude reaches for the thing it's about (e.g. editing the stop hook surfaces the stop-hook lesson). To stay quiet, it uses a **precision** retrieval path (`recall_precise`: pure vector cosine gate, no FTS/PPR — the opposite tuning from prompt recall), a per-session **seen-set** so no memory is injected twice, and it skips orientation memories already in the session context. `recall_min_cosine` (default `0.60`) is the relevance gate; raise it for fewer, surer hits.
+**Action-triggered recall.** Standard recall is *input*-triggered — memories are matched against your prompt. But mid-task Claude's reasoning drifts to subtopics the prompt never mentioned, and the relevant memory is missed. This hook makes recall follow what Claude is *doing*: before an Edit/Write and after a Read/Edit/Grep, it derives a signal from the activity (the code being changed, the file, the search pattern) and surfaces relevant memories — so a stored lesson appears exactly when Claude reaches for the thing it's about (e.g. editing the stop hook surfaces the stop-hook lesson). To stay quiet, it uses a **precision** retrieval path (`recall_precise`: pure vector cosine gate, no FTS/PPR — the opposite tuning from prompt recall), the shared seen-set (below), and it skips orientation memories already in the session context. `recall_min_cosine` (default `0.60`) is the relevance gate; raise it for fewer, surer hits.
+
+**Shared per-session seen-set.** All injection surfaces (per-prompt recall *and* action-triggered recall) dedup against one server-side seen-set keyed by session: a memory is injected **at most once per session**, no matter which path surfaces it first. Without this, the same memory could arrive twice through different surfaces — and noise, not missed recall, is what teaches a model to ignore injections. The set is dropped at SessionEnd (stale sessions expire after 48h).
 
 ---
 

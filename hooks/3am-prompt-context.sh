@@ -32,6 +32,12 @@ if [ -z "${PROMPT}" ]; then
     exit 0
 fi
 
+# session_id feeds the server-side shared seen-set: a memory is injected at most
+# once per session across BOTH this hook and action-triggered recall.
+SESSION_ID=$("${VENV}/bin/python" -c \
+    "import sys, json; d=json.loads(sys.argv[1]); print(d.get('session_id',''))" \
+    "${PAYLOAD}" 2>/dev/null || echo "")
+
 PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 
 PROJECT_ID=$(cd "${PROJECT_ROOT}" && \
@@ -40,8 +46,8 @@ PROJECT_ID=$(cd "${PROJECT_ROOT}" && \
     2>/dev/null || echo "")
 
 PROMPT_JSON=$("${VENV}/bin/python" -c \
-    "import sys, json; print(json.dumps({'project_id': sys.argv[1] or None, 'prompt': sys.argv[2], 'limit': 5}))" \
-    "${PROJECT_ID}" "${PROMPT}" 2>/dev/null || echo "")
+    "import sys, json; print(json.dumps({'project_id': sys.argv[1] or None, 'prompt': sys.argv[2], 'limit': 5, 'session_id': sys.argv[3] or None}))" \
+    "${PROJECT_ID}" "${PROMPT}" "${SESSION_ID}" 2>/dev/null || echo "")
 
 if [ -z "${PROMPT_JSON}" ]; then
     exit 0

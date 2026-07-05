@@ -13,7 +13,9 @@ thing it's about.
 
 Noise control (this fires on every matched tool call, so it must stay quiet):
   - relevance floor on the server side (min_score / min_cosine gate),
-  - a per-session seen-set so a memory is injected at most once per session,
+  - the SERVER-SIDE per-session seen-set, shared with prompt-context injection,
+    so a memory is injected at most once per session across ALL surfaces (we
+    pass session_id; the server dedups and marks only the hits it returns),
   - at most 1 hit on PostToolUse, 2 on the PreToolUse pre-edit guard.
 On anything not clearly relevant it emits nothing.
 """
@@ -80,8 +82,11 @@ def last_assistant_snippet(transcript_path: str, limit: int = 200) -> str:
         return ""
 
 
-def recall(port: int, project_id, query: str) -> list:
-    body = json.dumps({"project_id": project_id, "query": query, "limit": 4}).encode()
+def recall(port: int, project_id, query: str, session_id: str, limit: int) -> list:
+    body = json.dumps({
+        "project_id": project_id, "query": query,
+        "session_id": session_id or None, "limit": limit,
+    }).encode()
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/api/recall", data=body,
         headers={"Content-Type": "application/json"}, method="POST")
@@ -122,36 +127,22 @@ def main() -> int:
     except Exception:
         pass
 
-    hits = recall(port, project_id, query)
-    if not hits:
-        return 0
-
-    seen_file = f"/tmp/3am-recall-seen-{session_id}"
-    seen = set()
-    try:
-        with open(seen_file) as f:
-            seen = {ln.strip() for ln in f if ln.strip()}
-    except Exception:
-        pass
-
-    fresh = [h for h in hits if h.get("id") not in seen]
-    if not fresh:
-        return 0
-
+    # Dedup lives SERVER-SIDE (shared seen-set across prompt-context and action
+    # recall): ask for exactly what we'll show — the server filters already-seen
+    # memories and marks only the hits it returns.
     n = 2 if event == "PreToolUse" else 1
-    chosen = fresh[:n]
-
-    try:
-        with open(seen_file, "a") as f:
-            for h in chosen:
-                f.write(h["id"] + "\n")
-    except Exception:
-        pass
+    chosen = recall(port, project_id, query, session_id, n)
+    if not chosen:
+        return 0
 
     lines = ["[3am] Possibly relevant to what you're doing:"]
     for h in chosen:
-        age = f" ({h['age']})" if h.get("age") else ""
-        lines.append(f"- [{h.get('universe','')}{age}] {h.get('content','')}")
+        meta = [h.get("universe", "")]
+        if h.get("origin"):
+            meta.append(h["origin"])
+        if h.get("age"):
+            meta.append(h["age"])
+        lines.append(f"- [{', '.join(m for m in meta if m)}] {h.get('content','')}")
     out = {"hookSpecificOutput": {
         "hookEventName": event or "PostToolUse",
         "additionalContext": "\n".join(lines),

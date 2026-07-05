@@ -90,7 +90,31 @@ CONFLICT_SCAN_LIMIT = 20
 # Similarity gate for matching a free-text "wrong claim" to an existing memory.
 CORRECTION_MATCH_COSINE = 0.65
 
+# Store-time conflict surfacing: same-universe neighbors in the conflict band are
+# RETURNED to the caller as possible_conflicts — Claude judges supersede-vs-keep-
+# both. The engine never auto-acts (auto-resolution superseded distinct memories;
+# see the conflict_detection config comment).
+CONFLICT_SURFACE_LIMIT = 3
+
+# Provenance: who says so. Set at store time (source param → origin:<value> tag),
+# surfaced at recall so every injection carries its trust level. A user-stated
+# fact is authoritative; a past inference may have been wrong the day it was stored.
+VALID_ORIGINS = {"user-stated", "inferred", "observed-in-code", "ingested"}
+
+# Flagged (distrusted) memories: score multiplier in query_memory ranking.
+# recall_precise excludes them entirely — the precision surface must stay silent
+# on anything Claude has marked as suspect.
+FLAG_SCORE_MULT = 0.25
+
 CHARS_PER_TOKEN = 4  # rough approximation for max_tokens budget
+
+
+def _origin_from_tags(tags: Optional[list]) -> Optional[str]:
+    """Extract the provenance origin ('user-stated', 'inferred', …) from tags."""
+    for t in tags or []:
+        if isinstance(t, str) and t.startswith("origin:"):
+            return t[len("origin:"):]
+    return None
 
 # ── Temporal query detection (time-grounded retrieval) ────────────────────────
 _TEMPORAL_PATTERNS = re.compile(
@@ -153,9 +177,20 @@ def _classify_query(query: str) -> str:
     Returns: "personal" | "factual" | "procedural" | "balanced"
     """
     q = query.lower()
-    personal   = sum(1 for w in ("i ", "my ", " me ", " i'", " we ", "our ", "prefer", "like ", "feel ", "tell me about myself", "what do i") if w in q)
-    factual    = sum(1 for w in ("how ", "what is", "explain", "define", "does ", "work ", "what are", "describe", "documentation") if w in q)
-    procedural = sum(1 for w in ("when ", "should ", "pattern", "behavior", "behave", "rule ", "always ", "never ", "if i", "next time", "remember to") if w in q)
+
+    def _hits(words, phrases=()):
+        # Single tokens match on word boundaries so "i" doesn't fire inside "api"
+        # and "me" doesn't fire inside "some"; multi-word phrases match literally.
+        n = sum(1 for w in words if re.search(r"\b" + re.escape(w) + r"\b", q))
+        n += sum(1 for p in phrases if p in q)
+        return n
+
+    personal   = _hits(("i", "my", "me", "i'm", "i've", "we", "our", "prefer", "like", "feel", "myself"),
+                        ("tell me about myself", "what do i"))
+    factual    = _hits(("how", "explain", "define", "does", "work", "describe", "documentation"),
+                        ("what is", "what are"))
+    procedural = _hits(("when", "should", "pattern", "behavior", "behave", "rule", "always", "never"),
+                        ("if i", "next time", "remember to"))
     mx = max(personal, factual, procedural)
     if mx == 0:
         return "balanced"
@@ -323,6 +358,7 @@ class MemorySystem:
 
         self.memories: dict[str, MemoryEntry] = {}
         self.clusters: dict[str, MemoryCluster] = {}
+        self.flags: dict[str, str] = {}   # memory_id → distrust reason (see flag_memory)
         self._clustering_dirty = False
         self._lanes_ready: Optional[bool] = None
         self._lock: Optional[asyncio.Lock] = None
@@ -360,6 +396,7 @@ class MemorySystem:
         conn = self._get_conn()
         self._init_db(conn)
         self._load_from_db(conn)
+        self._rebuild_fts(conn)
         self._cleanup_expired(conn)
 
     # ── Schema ────────────────────────────────────────────────────────────────
@@ -432,6 +469,15 @@ class MemorySystem:
                 status      TEXT NOT NULL DEFAULT 'pending'
             );
 
+            -- Distrust flags: Claude marks a memory as suspect (contradicts what it
+            -- sees now) without needing the right answer yet. Demoted in ranking,
+            -- excluded from precision recall, queued for review via list_flagged.
+            CREATE TABLE IF NOT EXISTS memory_flags (
+                memory_id  TEXT PRIMARY KEY,
+                reason     TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_links_source   ON memory_links(source_id);
             CREATE INDEX IF NOT EXISTS idx_links_target   ON memory_links(target_id);
             CREATE INDEX IF NOT EXISTS idx_mem_project    ON memories(project_id);
@@ -459,7 +505,10 @@ class MemorySystem:
             )
         """)
 
-        # FTS5 — drop + recreate on every startup to stay in sync
+        # FTS5 — drop + recreate on every startup to stay in sync. The index is
+        # (re)populated by _rebuild_fts() AFTER _load_from_db, from the decrypted
+        # in-memory content — NOT here from memories.content, which is Fernet
+        # ciphertext when encryption is on (indexing that yields a dead FTS lane).
         conn.execute("DROP TABLE IF EXISTS fts_memories")
         conn.execute("""
             CREATE VIRTUAL TABLE fts_memories USING fts5(
@@ -467,10 +516,6 @@ class MemorySystem:
                 content,
                 tokenize='porter ascii'
             )
-        """)
-        conn.execute("""
-            INSERT INTO fts_memories(memory_id, content)
-            SELECT id, content FROM memories
         """)
         conn.commit()
 
@@ -526,6 +571,10 @@ class MemorySystem:
                 torque_mass=row["torque_mass"],
             )
 
+        for row in conn.execute("SELECT memory_id, reason FROM memory_flags"):
+            if row["memory_id"] in self.memories:
+                self.flags[row["memory_id"]] = row["reason"] or ""
+
         row = conn.execute("SELECT value FROM meta WHERE key='stats'").fetchone()
         if row:
             try:
@@ -536,6 +585,24 @@ class MemorySystem:
         self.stats["total_memories"] = len(self.memories)
         self.stats["active_clusters"] = len(self.clusters)
         print(f"[Memory] Loaded {len(self.memories)} memories, {len(self.clusters)} clusters")
+
+    def _rebuild_fts(self, conn: sqlite3.Connection):
+        """(Re)populate the FTS index from the decrypted in-memory content.
+
+        FTS5 cannot search Fernet ciphertext, so the lexical lane must be built
+        from self.memories (already decrypted by _load_from_db) rather than the
+        memories.content column. TRADEOFF (accepted, see threat model): this makes
+        fts_memories a PLAINTEXT index on disk even under encryption-at-rest — the
+        price of keeping the FTS half of hybrid retrieval alive. _write_memory
+        keeps it in sync on each store; this rebuilds it after a restart.
+        """
+        conn.execute("DELETE FROM fts_memories")
+        conn.executemany(
+            "INSERT INTO fts_memories(memory_id, content) VALUES (?, ?)",
+            [(mid, e.content) for mid, e in self.memories.items()],
+        )
+        conn.commit()
+        print(f"[Memory] Rebuilt FTS index ({len(self.memories)} memories)")
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
@@ -572,6 +639,16 @@ class MemorySystem:
         self.stats["active_clusters"] = len(self.clusters)
         self.stats["last_cleanup"] = current_time
 
+    async def cleanup_expired(self):
+        """Async, lock-guarded entry point for TTL/decay cleanup.
+
+        _cleanup_expired writes to the shared connection, so it must hold the
+        write lock when invoked off the startup path (e.g. the hourly background
+        loop) to avoid racing concurrent stores.
+        """
+        async with self._get_lock():
+            self._cleanup_expired(self._get_conn())
+
     # ── Retention / decay ────────────────────────────────────────────────────
 
     def _calculate_retention(self, entry: MemoryEntry, current_time: float) -> float:
@@ -592,10 +669,12 @@ class MemorySystem:
         conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
         conn.execute("DELETE FROM vec_memories WHERE memory_id=?", (memory_id,))
         conn.execute("DELETE FROM fts_memories WHERE memory_id=?", (memory_id,))
+        conn.execute("DELETE FROM memory_flags WHERE memory_id=?", (memory_id,))
         conn.execute(
             "DELETE FROM memory_links WHERE source_id=? OR target_id=?",
             (memory_id, memory_id),
         )
+        self.flags.pop(memory_id, None)
 
     async def _write_memory(self, entry: MemoryEntry, embedding: list):
         emb_bytes = np.array(embedding, dtype=np.float32).tobytes()
@@ -621,9 +700,15 @@ class MemorySystem:
                 "INSERT INTO vec_memories(memory_id, embedding) VALUES (?, ?)",
                 (entry.id, emb_bytes),
             )
+            # FTS5 has no unique key, so INSERT OR REPLACE would just append a
+            # second row and leave the stale content searchable (a
+            # correct/supersede would never overwrite the old text). Delete then
+            # insert, mirroring vec_memories above. Content is PLAINTEXT by design
+            # (encryption-at-rest tradeoff — see _rebuild_fts).
+            conn.execute("DELETE FROM fts_memories WHERE memory_id=?", (entry.id,))
             conn.execute(
-                "INSERT OR REPLACE INTO fts_memories(memory_id, content) VALUES (?, ?)",
-                (entry.id, entry.content),  # FTS: always plain text
+                "INSERT INTO fts_memories(memory_id, content) VALUES (?, ?)",
+                (entry.id, entry.content),
             )
             conn.commit()
 
@@ -737,9 +822,12 @@ class MemorySystem:
         event_time: Optional[float] = None,
         category: str = "general",
         skip_dedup: bool = False,
+        source: Optional[str] = None,
     ) -> dict:
         """
-        Store a memory. Returns {id, cluster_theme}.
+        Store a memory. Returns {id, cluster_theme} plus, when same-scope
+        neighbors sit in the conflict band, possible_conflicts for the caller
+        to judge (see _scan_store_conflicts).
         Deduplicates within project scope (unless skip_dedup — used by supersede/
         correction paths, where the new fact may be near-identical to the old one
         it replaces and must not be merged back into it).
@@ -748,13 +836,17 @@ class MemorySystem:
                     for time-grounded recall. None → falls back to store time.
         category:   identity|preferences|projects|activities|general|… — drives
                     category-aware decay (stable facts resist decay).
+        source:     provenance — one of VALID_ORIGINS. Stored as an origin:<value>
+                    tag and surfaced at recall so injections carry trust level.
         """
         if universe not in VALID_UNIVERSES:
             universe = "episodic"
         if category not in VALID_CATEGORIES:
             category = "general"
         priority = max(1, min(5, priority))
-        tags = tags or []
+        tags = list(tags or [])
+        if source in VALID_ORIGINS and not _origin_from_tags(tags):
+            tags.append(f"origin:{source}")
 
         embedding = await self.embedder.embed(content)
         emb_bytes = np.array(embedding, dtype=np.float32).tobytes()
@@ -785,7 +877,21 @@ class MemorySystem:
                 cluster_theme = "General"
                 if existing and existing.cluster_id and existing.cluster_id in self.clusters:
                     cluster_theme = self.clusters[existing.cluster_id].theme
-                return {"id": row["memory_id"], "cluster_theme": cluster_theme, "deduped": True}
+                result = {"id": row["memory_id"], "cluster_theme": cluster_theme, "deduped": True}
+                # A same-fact-new-value store ("port 8765" → "port 9000") embeds
+                # ABOVE the dedup threshold, so it lands here — not in the
+                # conflict band — and the change would be silently lost. Return
+                # the existing content so the caller can spot a value difference
+                # and supersede instead.
+                if existing and existing.content.strip() != content.strip():
+                    result["existing_content"] = existing.content
+                    result["dedup_note"] = (
+                        "Stored NOTHING — treated as a duplicate of this existing "
+                        "memory. If your content actually changes a value or fact, "
+                        f"call supersede_memory('{row['memory_id']}', <new content>) "
+                        "instead; it bypasses dedup and retires the old value."
+                    )
+                return result
 
         now = time.time()
         entry_id = f"mem_{time.time_ns()}"
@@ -842,6 +948,23 @@ class MemorySystem:
 
         result = {"id": entry_id, "cluster_theme": cluster_theme}
 
+        # Store-time conflict surfacing: hand possible contradictions to the
+        # caller for judgment. Skipped on supersede/correction paths (skip_dedup)
+        # — those already manage supersession and the "conflict" would be the
+        # very memory being replaced. Runs BEFORE promotion so the scan uses the
+        # entry's original scope. Episodic is transient — not worth the noise.
+        if not skip_dedup and universe in ("declarative", "procedural"):
+            conflicts = self._scan_store_conflicts(entry, emb_bytes)
+            if conflicts:
+                result["possible_conflicts"] = conflicts
+                result["conflict_guidance"] = (
+                    "These stored memories are semantically close to what you just "
+                    "stored. Judge each: if it states the SAME fact with an outdated "
+                    "value, call mark_superseded(old_id, new_id) with the new id "
+                    f"'{entry_id}'. If it is a distinct fact on the same topic, do "
+                    "nothing. Do NOT supersede distinct facts."
+                )
+
         # Hybrid auto-promotion: if this project memory mirrors knowledge already
         # present in other projects, promote it (high confidence) or queue it
         # (borderline). Only declarative/procedural — episodic is transient.
@@ -851,6 +974,53 @@ class MemorySystem:
                 result["promotion"] = promo
 
         return result
+
+    def _scan_store_conflicts(self, entry: "MemoryEntry", emb_bytes: bytes) -> list:
+        """
+        Find same-universe neighbors in the conflict band (close-but-not-duplicate)
+        that the storing session is allowed to SEE — same project or general only.
+        Cross-project matches are deliberately excluded: this returns CONTENT in
+        the store_memory result, so including them would leak other projects'
+        memories through the store path (promotion's cross-project scan is safe
+        because it returns only ids/cosines).
+
+        Advisory only — the engine never auto-supersedes. Cosine cannot tell
+        "same fact, new value" from "two facts, one topic" (that failure is why
+        auto conflict-detection is off); the caller (Claude) makes that judgment.
+        """
+        conn = self._get_conn()
+        rows = conn.execute("""
+            SELECT memory_id, distance FROM vec_memories
+            WHERE embedding MATCH ? ORDER BY distance LIMIT ?
+        """, (emb_bytes, CONFLICT_SCAN_LIMIT)).fetchall()
+
+        out = []
+        now = time.time()
+        for r in rows:
+            mid, dist = r["memory_id"], r["distance"]
+            if mid == entry.id:
+                continue
+            if dist < CONFLICT_DIST_NEAR:
+                continue   # near-duplicate — dedup territory, not a conflict
+            if dist > CONFLICT_DIST_FAR:
+                break      # ordered by distance — past the conflict band
+            other = self.memories.get(mid)
+            if not other or other.superseded_by or other.universe != entry.universe:
+                continue
+            # Visibility: same project or general. When entry is general
+            # (project_id None), only general neighbors qualify.
+            if other.project_id is not None and other.project_id != entry.project_id:
+                continue
+            out.append({
+                "id": mid,
+                "content": other.content,
+                "cosine": round(1.0 - dist, 4),
+                "age": _humanize_age(other.timestamp, now),
+                "universe": other.universe,
+            })
+            if len(out) >= CONFLICT_SURFACE_LIMIT:
+                break
+        return out
 
     # ── Auto-promotion ──────────────────────────────────────────────────────────
 
@@ -1037,21 +1207,18 @@ class MemorySystem:
         else:
             ranked = [(sid, 1.0) for sid in seed_ids]
 
-        # Increment access_count
         now = time.time()
-        recalled_ids = [mid for mid, _ in ranked]
-        if recalled_ids:
-            async with self._get_lock():
-                conn.executemany(
-                    "UPDATE memories SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
-                    [(now, mid) for mid in recalled_ids],
-                )
-                conn.commit()
-            for mid in recalled_ids:
-                entry = self.memories.get(mid)
-                if entry:
-                    entry.access_count += 1
-                    entry.last_accessed = now
+
+        # Flagged (distrusted) memories sink in the ranking rather than vanish:
+        # they may still be right, but anything Claude marked suspect must not
+        # outrank an unflagged memory. Survivors are annotated so the caller
+        # sees the distrust reason alongside the content.
+        if self.flags:
+            ranked = sorted(
+                ((mid, score * (FLAG_SCORE_MULT if mid in self.flags else 1.0))
+                 for mid, score in ranked),
+                key=lambda x: -x[1],
+            )
 
         # Build result list within token budget, respecting per-universe caps
         query_type = _classify_query(query)
@@ -1092,7 +1259,10 @@ class MemorySystem:
                 "timestamp": entry.timestamp,
                 "age": _humanize_age(entry.timestamp, now),
                 "event_age": _humanize_age(entry.event_time, now),
+                "origin": _origin_from_tags(entry.tags),
             })
+            if entry.id in self.flags:
+                results[-1]["flagged"] = self.flags[entry.id] or "flagged as suspect"
             return True
 
         # Pass 1: respect per-universe caps (keeps context balanced for intent).
@@ -1127,6 +1297,24 @@ class MemorySystem:
                     continue
                 if not _emit(entry, score):
                     break
+
+        # Bump access_count ONLY for memories actually emitted (#6). Counting the
+        # whole PPR-expanded `ranked` set — as the hooks fire this on every prompt
+        # and tool call — inflated neighbors that were never shown, and
+        # access_resistance = 1/(1+n) then made them effectively immortal,
+        # defeating decay. Only a memory that made it into `results` was recalled.
+        if chosen:
+            async with self._get_lock():
+                conn.executemany(
+                    "UPDATE memories SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
+                    [(now, mid) for mid in chosen],
+                )
+                conn.commit()
+            for mid in chosen:
+                entry = self.memories.get(mid)
+                if entry:
+                    entry.access_count += 1
+                    entry.last_accessed = now
 
         return results
 
@@ -1163,6 +1351,10 @@ class MemorySystem:
             entry = self.memories.get(mid)
             if not entry or entry.superseded_by:
                 continue
+            # Flagged memories are excluded outright — the precision surface
+            # injects unprompted, so it must never push a distrusted memory.
+            if mid in self.flags:
+                continue
             if not self._is_visible(mid, project_id):
                 continue
             # Skip orientation memories already in the session context (ingested
@@ -1179,6 +1371,7 @@ class MemorySystem:
                 "age": _humanize_age(entry.timestamp, now),
                 "content": entry.content,
                 "cosine": round(cosine, 4),
+                "origin": _origin_from_tags(entry.tags),
             })
             if len(out) >= limit:
                 break
@@ -1375,6 +1568,8 @@ class MemorySystem:
                 "category": e.category,
                 "event_time": e.event_time,
                 "superseded": e.superseded_by is not None,
+                "origin": _origin_from_tags(e.tags),
+                "flagged": e.id in self.flags,
             })
         links = []
         try:
@@ -1499,6 +1694,8 @@ class MemorySystem:
         """Flag an existing memory as replaced by a newer one. It is not deleted
         — it fades fast (10× decay) and is filtered from retrieval, preserving an
         audit trail."""
+        if old_id == new_id:
+            return False   # self-supersession would hide the memory forever
         entry = self.memories.get(old_id)
         if not entry:
             return False
@@ -1515,26 +1712,37 @@ class MemorySystem:
         new_content: str,
         priority: Optional[int] = None,
         event_time: Optional[float] = None,
+        source: Optional[str] = None,
     ) -> dict:
         """
         Record that a fact CHANGED: store new_content as a fresh memory (inheriting
         the old one's scope/universe/category) and mark the old one superseded.
         Use when a previously-true fact is now different ("we migrated X→Y").
         Differs from correct_memory, which overwrites in place for a simple fix.
+
+        source: provenance of the NEW claim. The new fact's provenance is usually
+        different from the old one's (a user correction superseding an
+        observed-in-code fact), so a given source REPLACES the inherited
+        origin: tag rather than being skipped for its sake.
         """
         old = self.memories.get(old_memory_id)
         if not old:
             return {"ok": False, "error": "memory_not_found"}
+        tags = list(old.tags or [])
+        if source in VALID_ORIGINS:
+            tags = [t for t in tags
+                    if not (isinstance(t, str) and t.startswith("origin:"))]
         res = await self.store_memory(
             content=new_content,
             project_id=old.project_id,
             universe=old.universe,
             priority=priority if priority is not None else max(old.priority, 4),
-            tags=old.tags,
+            tags=tags,
             session_id=old.session_id,
             event_time=event_time,
             category=old.category,
             skip_dedup=True,
+            source=source,
         )
         new_id = res["id"]
         if new_id != old_memory_id:
@@ -1577,10 +1785,15 @@ class MemorySystem:
 
         if matched_id:
             old = self.memories[matched_id]
+            # A correction is user-stated by definition — replace any origin
+            # tag inherited from the memory being corrected.
+            tags = [t for t in (old.tags or [])
+                    if not (isinstance(t, str) and t.startswith("origin:"))]
             res = await self.store_memory(
                 content=correct_fact, project_id=project_id,
                 universe=old.universe, priority=max(old.priority, 4),
-                tags=old.tags, category=old.category, skip_dedup=True,
+                tags=tags, category=old.category, skip_dedup=True,
+                source="user-stated",
             )
             new_id = res["id"]
             if new_id != matched_id:
@@ -1590,7 +1803,7 @@ class MemorySystem:
 
         res = await self.store_memory(
             content=correct_fact, project_id=project_id,
-            universe="declarative", priority=4,
+            universe="declarative", priority=4, source="user-stated",
         )
         return {"ok": True, "corrected": False, "new_memory_id": res["id"]}
 
@@ -1685,18 +1898,79 @@ class MemorySystem:
             return {"ok": False, "error": "memory_not_found"}
         new_embedding = await self.embedder.embed(new_content)
         entry.content = new_content
-        # Remove old lane links
+        # Remove old lane links; a rewrite also clears any distrust flag — the
+        # content the flag referred to no longer exists.
         async with self._get_lock():
             conn = self._get_conn()
             conn.execute(
                 "DELETE FROM memory_links WHERE source_id=? OR target_id=?",
                 (memory_id, memory_id),
             )
+            conn.execute("DELETE FROM memory_flags WHERE memory_id=?", (memory_id,))
             conn.commit()
+        self.flags.pop(memory_id, None)
         self._lanes_ready = None
         await self._write_memory(entry, new_embedding)
         await self._build_semantic_links(memory_id, new_embedding, entry.universe)
         return {"id": memory_id, "ok": True}
+
+    # ── Distrust flags ────────────────────────────────────────────────────────
+
+    async def flag_memory(self, memory_id: str, reason: str = "") -> dict:
+        """
+        Mark a memory as suspect without needing the correct value yet — the
+        low-friction negative-feedback signal. Flagged memories are demoted in
+        query_memory ranking (FLAG_SCORE_MULT), excluded from recall_precise
+        (the unprompted injection surface), and queued for review via
+        list_flagged. Resolve by unflag (false alarm), correct/supersede
+        (know the right value now), or delete.
+        """
+        if memory_id not in self.memories:
+            return {"ok": False, "error": "memory_not_found"}
+        reason = (reason or "").strip()
+        self.flags[memory_id] = reason
+        async with self._get_lock():
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_flags(memory_id, reason, created_at) VALUES (?, ?, ?)",
+                (memory_id, reason, time.time()),
+            )
+            conn.commit()
+        return {"ok": True, "memory_id": memory_id}
+
+    async def unflag_memory(self, memory_id: str) -> dict:
+        """Clear a distrust flag (the memory turned out to be fine)."""
+        was_flagged = memory_id in self.flags
+        self.flags.pop(memory_id, None)
+        async with self._get_lock():
+            conn = self._get_conn()
+            conn.execute("DELETE FROM memory_flags WHERE memory_id=?", (memory_id,))
+            conn.commit()
+        return {"ok": True, "was_flagged": was_flagged}
+
+    async def list_flagged(self) -> list:
+        """All flagged memories with reasons, newest flag first — the review queue."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT memory_id, reason, created_at FROM memory_flags ORDER BY created_at DESC"
+        ).fetchall()
+        out = []
+        now = time.time()
+        for r in rows:
+            e = self.memories.get(r["memory_id"])
+            if not e:
+                continue
+            out.append({
+                "id": e.id,
+                "content": e.content,
+                "reason": r["reason"],
+                "flagged_age": _humanize_age(r["created_at"], now),
+                "age": _humanize_age(e.timestamp, now),
+                "universe": e.universe,
+                "project_id": e.project_id,
+                "priority": e.priority,
+            })
+        return out
 
     # ── PPR ───────────────────────────────────────────────────────────────────
 
@@ -1833,28 +2107,28 @@ class MemorySystem:
         top = sorted(word_counts, key=lambda w: -word_counts[w])[:3]
         return " / ".join(top) if top else "General"
 
-    def _clustering_cpu_work(
+    def _gather_clustering_inputs(
         self, target_clusters: int, memory_id_subset: Optional[list] = None
-    ) -> dict:
-        """Pure CPU clustering — safe to run in executor."""
+    ) -> Optional[dict]:
+        """Collect all DB + in-memory data the clusterer needs.
+
+        MUST run on the event-loop thread: it touches the shared SQLite
+        connection (embeddings + lane links) and reads self.memories. The pure
+        CPU work is handed off to an executor separately (see _run_clusterer) —
+        the executor must NEVER touch self._conn, because check_same_thread=False
+        permits cross-thread use but not *simultaneous* use with event-loop writes.
+        """
         ids_to_cluster = memory_id_subset or list(self.memories.keys())
         memory_ids, embeddings = self._fetch_all_embeddings(ids_to_cluster)
 
         if len(memory_ids) < MIN_MEMORIES_FOR_CLUSTERING:
-            return {}
+            return None
 
-        print(f"[Clustering] {len(memory_ids)} memories → target {target_clusters} clusters")
-
-        from clustering import ClusteringConfig, MemoryClusterer
+        from clustering import ClusteringConfig
 
         config = ClusteringConfig.from_dict(self.clustering_config_dict)
         entries = [self.memories[m] for m in memory_ids]
-        universes = [e.universe for e in entries]
-        priorities = [e.priority for e in entries]
-        access_counts = [e.access_count for e in entries]
-        timestamps = [e.timestamp for e in entries]
         current_time = time.time()
-        retention_scores = [self._calculate_retention(e, current_time) for e in entries]
 
         id_set = set(memory_ids)
         conn = self._get_conn()
@@ -1867,11 +2141,31 @@ class MemorySystem:
             and r[2] >= config.lane_boost_min_weight
         }
 
-        clusterer = MemoryClusterer(config)
+        return {
+            "config": config,
+            "memory_ids": memory_ids,
+            "embeddings": embeddings,
+            "universes": [e.universe for e in entries],
+            "priorities": [e.priority for e in entries],
+            "access_counts": [e.access_count for e in entries],
+            "timestamps": [e.timestamp for e in entries],
+            "retention_scores": [self._calculate_retention(e, current_time) for e in entries],
+            "lane_pairs": lane_pairs,
+            "target_clusters": target_clusters,
+        }
+
+    @staticmethod
+    def _run_clusterer(data: dict) -> dict:
+        """Pure CPU clustering — safe in an executor thread (no DB, no shared state)."""
+        from clustering import MemoryClusterer
+
+        print(f"[Clustering] {len(data['memory_ids'])} memories → "
+              f"target {data['target_clusters']} clusters")
+        clusterer = MemoryClusterer(data["config"])
         return clusterer.cluster(
-            memory_ids, embeddings, universes, priorities,
-            access_counts, timestamps, retention_scores,
-            lane_pairs, target_clusters,
+            data["memory_ids"], data["embeddings"], data["universes"],
+            data["priorities"], data["access_counts"], data["timestamps"],
+            data["retention_scores"], data["lane_pairs"], data["target_clusters"],
         )
 
     async def run_clustering(self) -> dict:
@@ -1881,11 +2175,14 @@ class MemorySystem:
             return {"status": "skipped", "reason": "too_few_memories"}
 
         target_clusters = max(2, n // 4)
+        # Read all DB/in-memory inputs HERE, on the event loop (#4), then hand
+        # pure data to the executor so the worker thread never touches self._conn.
+        data = self._gather_clustering_inputs(target_clusters, None)
+        if not data:
+            return {"status": "skipped", "reason": "too_few_memories"}
         loop = asyncio.get_event_loop()
         try:
-            raw = await loop.run_in_executor(
-                None, self._clustering_cpu_work, target_clusters, None
-            )
+            raw = await loop.run_in_executor(None, self._run_clusterer, data)
         except Exception as e:
             print(f"[Clustering] Error: {e}")
             return {"status": "error", "error": str(e)}
@@ -1975,7 +2272,7 @@ class MemorySystem:
         """Batch store a list of propositions from a document."""
         if not propositions:
             return {"stored": 0, "total": 0}
-        tags = ["ingest"]
+        tags = ["ingest", "origin:ingested"]   # provenance: came from a document
         if source_path:
             tags.append(f"source:{Path(source_path).name}")
         stored = 0

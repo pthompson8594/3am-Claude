@@ -225,6 +225,41 @@ _config: dict = {}
 _bg_task: Optional[asyncio.Task] = None
 _debounce_task: Optional[asyncio.Task] = None
 
+# ── Shared per-session seen-set ───────────────────────────────────────────────
+# One dedup surface for ALL injection paths (prompt-context AND action recall).
+# Previously only the recall hook deduped (via a /tmp file) and prompt-context
+# had no dedup at all, so the same memory could be injected twice in a session
+# through different paths — the fastest way to teach the model to ignore the
+# injection block. Server-side, keyed by Claude Code session_id.
+#   memory_id in seen → do not inject again this session.
+# Entries expire after _SEEN_TTL (sessions that never sent a SessionEnd).
+
+_seen_sessions: dict = {}          # session_id → {"ids": set, "ts": last_touch}
+_SEEN_TTL = 48 * 3600
+
+
+def _session_seen(session_id: str) -> set:
+    """The seen-set for a session (created on first use). Prunes stale sessions."""
+    now = time.time()
+    if len(_seen_sessions) > 32:
+        for sid in [s for s, e in _seen_sessions.items() if now - e["ts"] > _SEEN_TTL]:
+            _seen_sessions.pop(sid, None)
+    entry = _seen_sessions.setdefault(session_id, {"ids": set(), "ts": now})
+    entry["ts"] = now
+    return entry["ids"]
+
+
+def _filter_unseen(session_id: Optional[str], items: list, mark: bool = True) -> list:
+    """Drop items whose memory id was already injected this session; mark the rest
+    as seen. No session_id (old hook version) → no dedup, unchanged behavior."""
+    if not session_id:
+        return items
+    seen = _session_seen(session_id)
+    fresh = [it for it in items if it.get("id") not in seen]
+    if mark:
+        seen.update(it["id"] for it in fresh if it.get("id"))
+    return fresh
+
 
 # ── Clustering helpers ────────────────────────────────────────────────────────
 
@@ -250,11 +285,15 @@ def _schedule_cluster():
 # ── Background task ───────────────────────────────────────────────────────────
 
 async def _background_loop():
-    """Full re-cluster every hour, regardless of unclustered count."""
+    """Hourly TTL/decay cleanup + full re-cluster, regardless of unclustered count."""
     while True:
         await asyncio.sleep(3600)
         try:
             if _memory:
+                # Cleanup must run periodically, not just at startup — this is a
+                # long-lived daemon, so TTL-expired episodics and decayed memories
+                # would otherwise accumulate and stay retrievable between restarts.
+                await _memory.cleanup_expired()
                 n = len(_memory.memories)
                 print(f"[3am-claude] Hourly recluster ({n} memories)...")
                 result = await _memory.run_clustering()
@@ -296,6 +335,7 @@ async def store_memory(
     session_id: Optional[str] = None,
     event_time: Optional[float] = None,
     category: str = "general",
+    source: Optional[str] = None,
 ) -> dict:
     """
     Store a memory in the persistent knowledge base.
@@ -314,6 +354,19 @@ async def store_memory(
       category: identity|preferences|relationship|projects|activities|general|skill —
                 drives category-aware decay (identity/preferences resist decay; a
                 project or activity is time-bound and fades normally).
+      source: provenance — who says so. ALWAYS set it:
+                "user-stated"      — the user explicitly told you this (authoritative)
+                "inferred"         — you concluded it from reasoning (could be wrong)
+                "observed-in-code" — read from the code/repo (true when stored, can
+                                     drift as the code changes)
+                "ingested"         — extracted from a document
+              Surfaced at recall so future sessions know how much to trust the memory.
+
+    If the result contains possible_conflicts: those are existing memories
+    semantically close to the one just stored. Judge each one — if it states the
+    SAME fact with an outdated value, call mark_superseded(old_id, new_id). If it
+    is a distinct fact on the same topic, leave it alone. Never supersede a
+    distinct fact just because it is similar.
 
     Memory hygiene: when you complete work that was previously stored as "planned",
     "todo", or "not yet implemented", use correct_memory or delete_memory to update
@@ -331,6 +384,9 @@ async def store_memory(
     if warning:
         return {"error": warning}
 
+    if source is not None and source not in ("user-stated", "inferred", "observed-in-code", "ingested"):
+        return {"error": "invalid source — use one of: user-stated, inferred, observed-in-code, ingested"}
+
     result = await _memory.store_memory(
         content=content.strip(),
         project_id=project_id or None,
@@ -341,10 +397,75 @@ async def store_memory(
         session_id=session_id,
         event_time=event_time,
         category=category,
+        source=source,
     )
     if "id" in result:
         _schedule_cluster()
     return result
+
+
+@mcp.tool()
+async def mark_superseded(old_memory_id: str, new_memory_id: str) -> dict:
+    """
+    Mark an existing memory as replaced by another ALREADY-STORED memory. The old
+    one fades fast (10× decay) and drops out of retrieval but stays auditable.
+
+    Primary use: resolving possible_conflicts returned by store_memory — when you
+    judge that an old memory states the same fact as the new one with an outdated
+    value. (If the new content isn't stored yet, use supersede_memory instead,
+    which stores and marks in one step.)
+
+    Returns {ok: true} or {ok: false, error: "..."}
+    """
+    if not _memory.memories.get(new_memory_id):
+        return {"ok": False, "error": "new_memory_not_found"}
+    if old_memory_id == new_memory_id:
+        return {"ok": False, "error": "cannot_supersede_self"}
+    ok = await _memory.mark_superseded(old_memory_id, new_memory_id)
+    return {"ok": ok} if ok else {"ok": False, "error": "old_memory_not_found"}
+
+
+@mcp.tool()
+async def flag_memory(memory_id: str, reason: str = "") -> dict:
+    """
+    Mark a memory as SUSPECT without needing the correct value yet — the
+    low-friction distrust signal. Use the moment an injected/recalled memory
+    contradicts what you're looking at (code, docs, user statement) and you
+    don't yet know the right answer.
+
+    Effect: demoted in query_memory ranking, excluded from action-triggered
+    recall injection, queued for review (list_flagged). Not deleted.
+
+    When you DO know the right value, prefer correct_memory / supersede_memory /
+    apply_correction instead. Clear a false alarm with unflag_memory.
+
+    Returns {ok: true, memory_id} or {ok: false, error: "..."}
+    """
+    return await _memory.flag_memory(memory_id, reason)
+
+
+@mcp.tool()
+async def unflag_memory(memory_id: str) -> dict:
+    """
+    Clear a distrust flag — the flagged memory turned out to be correct.
+    Restores normal ranking and recall eligibility.
+
+    Returns {ok: true, was_flagged: bool}
+    """
+    return await _memory.unflag_memory(memory_id)
+
+
+@mcp.tool()
+async def list_flagged() -> list:
+    """
+    The distrust review queue: all flagged memories with reasons, newest first.
+    For each, verify against current reality and resolve: unflag_memory (it was
+    fine), correct_memory/supersede_memory (now know the right value), or
+    delete_memory (it's junk).
+
+    Returns [{id, content, reason, flagged_age, age, universe, project_id, priority}]
+    """
+    return await _memory.list_flagged()
 
 
 @mcp.tool()
@@ -353,6 +474,7 @@ async def supersede_memory(
     new_content: str,
     priority: Optional[int] = None,
     event_time: Optional[float] = None,
+    source: Optional[str] = None,
 ) -> dict:
     """
     Record that a fact CHANGED over time. Stores new_content as a fresh memory
@@ -362,6 +484,12 @@ async def supersede_memory(
     "moved from Saskatoon to Regina". For a simple correction of a wrong value
     in place, use correct_memory instead.
 
+    source: provenance of the NEW claim (user-stated | inferred | observed-in-code
+    | ingested). Set it — the new fact's provenance usually differs from the old
+    one's (e.g. a user correction replacing an observed-in-code fact); it REPLACES
+    the origin inherited from the superseded memory. Omitted → the old origin
+    carries over.
+
     Returns {ok, new_memory_id, superseded} or {ok: false, error}
     """
     if not new_content or not new_content.strip():
@@ -369,8 +497,11 @@ async def supersede_memory(
     warning = _secrets_warning(new_content)
     if warning:
         return {"error": warning}
+    if source is not None and source not in ("user-stated", "inferred", "observed-in-code", "ingested"):
+        return {"error": "invalid source — use one of: user-stated, inferred, observed-in-code, ingested"}
     result = await _memory.supersede_memory(
-        old_memory_id, new_content.strip(), priority=priority, event_time=event_time)
+        old_memory_id, new_content.strip(), priority=priority, event_time=event_time,
+        source=source)
     if result.get("ok"):
         _schedule_cluster()
     return result
@@ -751,6 +882,8 @@ class _PromptContextApp:
       project_id — sha256[:16] of git root (may be null)
       prompt     — the raw user prompt text
       limit      — max memories to return (default 5)
+      session_id — Claude Code session id, for the shared seen-set (dedup across
+                   this endpoint AND action recall; a memory injects once/session)
     """
 
     async def __call__(self, scope, receive, send):
@@ -771,6 +904,7 @@ class _PromptContextApp:
         project_id = body.get("project_id") or None
         prompt = body.get("prompt", "").strip()
         limit = min(int(body.get("limit", 5)), 10)
+        session_id = body.get("session_id") or None
 
         if not prompt:
             resp = JSONResponse({"additionalContext": ""})
@@ -784,6 +918,7 @@ class _PromptContextApp:
             max_tokens=800,
             min_score=0.06,
         )
+        memories = _filter_unseen(session_id, memories)
 
         if not memories:
             resp = JSONResponse({"additionalContext": ""})
@@ -794,9 +929,15 @@ class _PromptContextApp:
         now_str = _dt.datetime.now().strftime("%Y-%m-%d %H:%M %Z").strip()
         lines = [f"[3am] Current time: {now_str}", "Relevant memories (with age):"]
         for m in memories:
-            age = m.get("age")
-            age_tag = f" ({age})" if age else ""
-            lines.append(f"- [{m['universe']}{age_tag}] {m['content']}")
+            meta = [m["universe"]]
+            if m.get("origin"):
+                meta.append(m["origin"])
+            if m.get("age"):
+                meta.append(m["age"])
+            line = f"- [{', '.join(meta)}] {m['content']}"
+            if m.get("flagged"):
+                line += f"\n  ⚠ flagged as suspect: {m['flagged']} — verify before relying on it"
+            lines.append(line)
 
         resp = JSONResponse({"additionalContext": "\n".join(lines)})
         await resp(scope, receive, send)
@@ -815,8 +956,10 @@ class _RecallApp:
     Body (JSON):
       project_id — sha256[:16] of git root (may be null)
       query      — derived activity signal
-      limit      — max hits (default 4)
-      min_score  — relevance floor (default 0.10 — higher than prompt recall, since
+      limit      — max hits to RETURN (default 4)
+      session_id — Claude Code session id for the shared seen-set; the server
+                   dedups and only marks hits it actually returns
+      min_cosine — relevance floor override (default: config recall_min_cosine —
                    this fires constantly and must stay quiet unless clearly relevant)
     """
 
@@ -836,18 +979,25 @@ class _RecallApp:
         project_id = body.get("project_id") or None
         query = (body.get("query") or "").strip()
         limit = min(int(body.get("limit", 4)), 8)
+        session_id = body.get("session_id") or None
         min_cosine = float(body.get("min_cosine", _memory.recall_min_cosine))
         if len(query) < 3:
             resp = JSONResponse({"hits": []})
             await resp(scope, receive, send)
             return
 
+        # Fetch with headroom so seen hits don't starve the response, then mark
+        # ONLY what we return — an over-fetched hit that isn't shown must stay
+        # eligible for a later, possibly more relevant, injection.
         hits = await _memory.recall_precise(
             query=query,
             project_id=project_id,
             min_cosine=min_cosine,
-            limit=limit,
+            limit=min(limit + 4, 8),
         )
+        hits = _filter_unseen(session_id, hits, mark=False)[:limit]
+        if session_id and hits:
+            _session_seen(session_id).update(h["id"] for h in hits)
         resp = JSONResponse({"hits": hits})
         await resp(scope, receive, send)
 
@@ -881,6 +1031,9 @@ class _SessionStopApp:
         # Recluster first — incorporates memories stored this session
         _schedule_cluster()
         print(f"[3am-claude] SessionEnd: clustering scheduled for {session_id}")
+
+        # Drop this session's seen-set — the dedup window is per-session.
+        _seen_sessions.pop(session_id, None)
 
         result = await _memory.wipe_session_episodic(session_id)
         wiped = result.get("wiped", 0)
